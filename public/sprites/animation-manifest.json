@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "canvas": [512, 512],
+  "format": "RGBA PNG",
+  "sequence": "runtime_forward_then_reverse",
+  "frame_pattern": "{action}_{index:03d}.png",
+  "actions": {
+    "catch_cursor": {"frames": 12, "fps": 12, "loop": false},
+    "chase_cursor": {"frames": 16, "fps": 12, "loop": true},
+    "clicked": {"frames": 8, "fps": 12, "loop": false},
+    "dragged": {"frames": 12, "fps": 12, "loop": true},
+    "drop_landing": {"frames": 12, "fps": 12, "loop": false},
+    "error": {"frames": 12, "fps": 12, "loop": false},
+    "follow_cursor": {"frames": 8, "fps": 12, "loop": true},
+    "good_morning": {"frames": 14, "fps": 10, "loop": false},
+    "good_night": {"frames": 18, "fps": 8, "loop": false},
+    "idle_blink": {"frames": 6, "fps": 10, "loop": true},
+    "idle_breath": {"frames": 8, "fps": 8, "loop": true},
+    "idle_look_around": {"frames": 10, "fps": 8, "loop": true},
+    "listen": {"frames": 10, "fps": 8, "loop": true},
+    "loading": {"frames": 12, "fps": 10, "loop": true},
+    "low_battery": {"frames": 12, "fps": 8, "loop": true},
+    "multi_clicked": {"frames": 12, "fps": 12, "loop": false},
+    "offline": {"frames": 12, "fps": 10, "loop": false},
+    "stand_sleep": {"frames": 16, "fps": 8, "loop": true},
+    "success": {"frames": 12, "fps": 12, "loop": false},
+    "talk_normal": {"frames": 12, "fps": 12, "loop": true},
+    "thinking": {"frames": 12, "fps": 8, "loop": true},
+    "type_fast": {"frames": 12, "fps": 12, "loop": true},
+    "user_typing": {"frames": 10, "fps": 10, "loop": true},
+    "wave_hello": {"frames": 12, "fps": 10, "loop": true}
+  }
+}
