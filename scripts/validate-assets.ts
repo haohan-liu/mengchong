@@ -3,7 +3,7 @@ import { join } from "node:path";
 import sharp from "sharp";
 
 const root = process.cwd();
-const manifest = JSON.parse(await readFile(join(root, "animations_manifest.json"), "utf8")) as Array<{ id: string; frames: number; playMode: string; returnTo: string | null }>;
+const manifest = JSON.parse(await readFile(join(root, "animations_manifest.json"), "utf8")) as Array<{ id: string; frames: number; playMode: string; returnTo: string | null; playback?: { enter?: { from: number; to: number }; sustain?: { from: number; to: number; mode?: string }; exit?: { from: number; to: number }; interruptPolicy?: string } }>;
 const spriteRoot = join(root, "public/sprites");
 const directories = (await readdir(spriteRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
 const expected = manifest.map((entry) => entry.id).sort();
@@ -14,6 +14,11 @@ let once = 0;
 for (const definition of manifest) {
   definition.playMode === "loop" ? loop++ : once++;
   if (definition.playMode === "once" && definition.returnTo !== "idle_breath") throw new Error(`${definition.id} 的 returnTo 必须是 idle_breath`);
+  if ((definition.id === "type_fast" || definition.id === "user_typing")
+    && (definition.playback?.sustain?.from !== 1 || definition.playback.sustain.mode !== "ping-pong"
+      || definition.playback.enter?.to !== 0 || definition.playback.exit?.to !== 0)) {
+    throw new Error(`${definition.id} 必须使用 schema v2 的进入/持续/退出段，且站立帧不得进入循环`);
+  }
   const directory = join(spriteRoot, definition.id);
   const files = (await readdir(directory)).filter((file) => file.endsWith(".png")).sort();
   if (files.length !== definition.frames) throw new Error(`${definition.id} 帧数错误：${files.length}/${definition.frames}`);

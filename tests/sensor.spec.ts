@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 import { readFile } from "node:fs/promises";
 import { categorize } from "../src/shared/categorize";
 
-describe("sensor categorization and fallback boundary", () => {
-  it("categorizes known foreground processes locally", () => {
-    expect(categorize("Figma.exe")).toBe("design");
-    expect(categorize("Code.exe")).toBe("development");
-    expect(categorize("Teams.exe")).toBe("communication");
+describe("sensor classification and fallback boundary", () => {
+  it("classifies known foreground processes locally", () => {
+    expect(categorize("Figma.exe")).toBe("designing");
+    expect(categorize("Code.exe")).toBe("developing");
+    expect(categorize("Teams.exe")).toBe("meeting");
     expect(categorize("unknown.exe")).toBe("other");
   });
 

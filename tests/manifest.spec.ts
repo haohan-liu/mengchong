@@ -14,4 +14,14 @@ describe("24-action delivery contract", () => {
     expect(once).toHaveLength(9);
     expect(once.every((item) => item.returnTo === "idle_breath")).toBe(true);
   });
+
+  it("keeps typing stand frames outside the sustained loop", () => {
+    for (const id of ["user_typing", "type_fast"]) {
+      const action = manifest.find((item) => item.id === id);
+      expect(action?.playback?.sustain.from).toBe(1);
+      expect(action?.playback?.sustain.mode).toBe("ping-pong");
+      expect(action?.playback?.enter.to).toBe(0);
+      expect(action?.playback?.interruptPolicy).toBe("after-exit");
+    }
+  });
 });

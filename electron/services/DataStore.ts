@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type {
   ActivitySnapshot,
-  AppCategory,
+  ActivityKind,
   ChatMessage,
   ChatMessagePage,
   ChatSession,
@@ -10,14 +10,16 @@ import type {
   DailyStatistic,
   StatisticsSummary
 } from "../../src/types.js";
-import { categorize } from "../../src/shared/categorize.js";
+import { activityKinds } from "../../src/types.js";
+import { productiveActivityKinds } from "../../src/shared/activity.js";
 
-const STATISTICS_VERSION = 3;
+const STATISTICS_VERSION = 4;
+const USAGE_VERSION = 1;
 const CHAT_INDEX_VERSION = 2;
 const MAX_CHAT_SESSIONS = 50;
 const MAX_CHAT_MESSAGES = 200;
 const CHAT_CACHE_SIZE = 2;
-const categories: AppCategory[] = ["design", "office", "development", "communication", "entertainment", "other"];
+const categories: ActivityKind[] = [...activityKinds];
 
 const dayKey = (time = Date.now()): string => {
   const date = new Date(time);
@@ -26,28 +28,28 @@ const dayKey = (time = Date.now()): string => {
 
 function emptyDay(date = dayKey()): DailyStatistic {
   return {
-    date, activeSeconds: 0, focusSeconds: 0, inputEvents: 0, appSwitches: 0,
+    date, activeSeconds: 0, restSeconds: 0, productiveSeconds: 0, inputEvents: 0, appSwitches: 0,
     breaksCompleted: 0, hydrationCompleted: 0, aiCalls: 0, localReplies: 0,
-    categories: Object.fromEntries(categories.map((key) => [key, 0])) as Record<AppCategory, number>
+    categories: Object.fromEntries(categories.map((key) => [key, 0])) as Record<ActivityKind, number>
   };
 }
 
-function normalizeDay(value: Partial<DailyStatistic>, repairLegacyInput = false): DailyStatistic {
+function normalizeDay(value: Partial<DailyStatistic>, repairLegacyInput = false, clearLegacyCategories = false): DailyStatistic {
   const base = emptyDay(String(value.date || dayKey()));
   const inputEvents = Math.max(0, Number(value.inputEvents) || 0);
   return {
     ...base,
-    ...value,
     date: String(value.date || base.date),
     activeSeconds: Math.max(0, Number(value.activeSeconds) || 0),
-    focusSeconds: Math.max(0, Number(value.focusSeconds) || 0),
+    restSeconds: Math.max(0, Number(value.restSeconds) || 0),
+    productiveSeconds: clearLegacyCategories ? 0 : Math.max(0, Number(value.productiveSeconds) || 0),
     inputEvents: Math.round(repairLegacyInput ? inputEvents / 10 : inputEvents),
     appSwitches: Math.max(0, Math.round(Number(value.appSwitches) || 0)),
     breaksCompleted: Math.max(0, Math.round(Number(value.breaksCompleted) || 0)),
     hydrationCompleted: Math.max(0, Math.round(Number(value.hydrationCompleted) || 0)),
     aiCalls: Math.max(0, Math.round(Number(value.aiCalls) || 0)),
     localReplies: Math.max(0, Math.round(Number(value.localReplies) || 0)),
-    categories: Object.fromEntries(categories.map((key) => [key, Math.max(0, Number(value.categories?.[key]) || 0)])) as Record<AppCategory, number>
+    categories: Object.fromEntries(categories.map((key) => [key, clearLegacyCategories ? 0 : Math.max(0, Number(value.categories?.[key]) || 0)])) as Record<ActivityKind, number>
   };
 }
 
@@ -129,8 +131,12 @@ export class DataStore {
   private chatsLoaded = false;
   private chatLoadPromise: Promise<void> | null = null;
   private statisticsWriteChain: Promise<void> = Promise.resolve();
+  private usageWriteChain: Promise<void> = Promise.resolve();
+  private usageMonths: Record<string, number> = {};
   private chatWriteChain: Promise<void> = Promise.resolve();
   private statisticsSaveTimer: NodeJS.Timeout | null = null;
+  private pendingUnknownSeconds = 0;
+  private pendingUnknownProcess = "";
 
   constructor(private dataDirectory: () => string) {}
 
@@ -141,7 +147,8 @@ export class DataStore {
       const parsed = JSON.parse(await readFile(join(this.dataDirectory(), "statistics.json"), "utf8")) as { version?: number; days?: DailyStatistic[]; proactive?: { date?: string; count?: number } } | DailyStatistic[];
       const legacy = Array.isArray(parsed);
       const values = legacy ? parsed : (parsed.days ?? []);
-      this.days = values.map((entry) => normalizeDay(entry, legacy || (parsed.version ?? 0) < 2));
+      const legacyVersion = legacy ? 0 : (parsed.version ?? 0);
+      this.days = values.map((entry) => normalizeDay(entry, legacy || legacyVersion < 2, legacyVersion < STATISTICS_VERSION));
       const proactive = legacy ? null : parsed.proactive;
       this.proactive = {
         date: String(proactive?.date || dayKey()),
@@ -151,6 +158,17 @@ export class DataStore {
     } catch {
       this.days = [];
       this.proactive = { date: dayKey(), count: 0 };
+    }
+    try {
+      const usage = JSON.parse(await readFile(this.usagePath(), "utf8")) as { version?: number; months?: Record<string, number> };
+      this.usageMonths = Object.fromEntries(Object.entries(usage.months ?? {}).map(([month, count]) => [month, Math.max(0, Math.round(Number(count) || 0))]));
+    } catch {
+      this.usageMonths = {};
+      for (const day of this.days) {
+        const month = day.date.slice(0, 7);
+        this.usageMonths[month] = (this.usageMonths[month] ?? 0) + day.aiCalls;
+      }
+      await this.saveUsage();
     }
     this.lastSnapshot = null;
     this.chatIndex = [];
@@ -165,6 +183,7 @@ export class DataStore {
   }
 
   private statisticsPath(): string { return join(this.dataDirectory(), "statistics.json"); }
+  private usagePath(): string { return join(this.dataDirectory(), "usage.json"); }
   private chatIndexPath(): string { return join(this.dataDirectory(), "chat-index.json"); }
   private legacyChatsPath(): string { return join(this.dataDirectory(), "chats.json"); }
   private chatsDirectory(): string { return join(this.dataDirectory(), "chats"); }
@@ -183,6 +202,13 @@ export class DataStore {
     const snapshot = { version: STATISTICS_VERSION, days: structuredClone(this.days), proactive: structuredClone(this.proactive) };
     const write = this.statisticsWriteChain.catch(() => undefined).then(() => this.atomicPath(this.statisticsPath(), snapshot));
     this.statisticsWriteChain = write;
+    return write;
+  }
+
+  private saveUsage(): Promise<void> {
+    const snapshot = { version: USAGE_VERSION, months: structuredClone(this.usageMonths) };
+    const write = this.usageWriteChain.catch(() => undefined).then(() => this.atomicPath(this.usagePath(), snapshot));
+    this.usageWriteChain = write;
     return write;
   }
 
@@ -294,12 +320,30 @@ export class DataStore {
     this.lastSnapshot = snapshot;
     let day = this.days.find((entry) => entry.date === dayKey(snapshot.timestamp));
     if (!day) { day = emptyDay(dayKey(snapshot.timestamp)); this.days.push(day); }
-    const category = categorize(snapshot.foregroundProcess, snapshot.foregroundPath, snapshot.windowTitle, snapshot.documentTitle);
-    if (snapshot.idleSeconds < 60) {
-      day.activeSeconds += elapsed;
-      day.categories[category] += elapsed;
-      if (["design", "office", "development"].includes(category) && snapshot.activeAppSeconds >= 60) day.focusSeconds += elapsed;
+    const category = snapshot.activityKind;
+    if (previous && previous.foregroundProcess !== snapshot.foregroundProcess && this.pendingUnknownSeconds > 0) {
+      day.categories.other += this.pendingUnknownSeconds;
+      this.pendingUnknownSeconds = 0;
+      this.pendingUnknownProcess = "";
     }
+    if (!(snapshot.classificationSource === "fallback" && snapshot.classificationConfidence < 0)
+      && this.pendingUnknownProcess === snapshot.foregroundProcess && this.pendingUnknownSeconds > 0) {
+      day.categories[category] += this.pendingUnknownSeconds;
+      if (productiveActivityKinds.has(category)) day.productiveSeconds += this.pendingUnknownSeconds;
+      this.pendingUnknownSeconds = 0;
+      this.pendingUnknownProcess = "";
+    }
+    if (snapshot.presenceState === "active") {
+      day.activeSeconds += elapsed;
+      if (snapshot.classificationSource === "fallback" && snapshot.classificationConfidence < 0) {
+        this.pendingUnknownSeconds += elapsed;
+        this.pendingUnknownProcess = snapshot.foregroundProcess;
+      } else {
+        day.categories[category] += elapsed;
+        if (productiveActivityKinds.has(category)) day.productiveSeconds += elapsed;
+      }
+    }
+    if (snapshot.presenceState === "resting") day.restSeconds += elapsed;
     day.inputEvents += snapshot.keyboardCount1s + snapshot.mouseClicks1s + snapshot.mouseWheel1s;
     if (previous && previous.foregroundProcess !== snapshot.foregroundProcess && previous.foregroundProcess !== "unknown") day.appSwitches += 1;
     this.pruneDays();
@@ -310,6 +354,11 @@ export class DataStore {
     let day = this.days.find((entry) => entry.date === dayKey());
     if (!day) { day = emptyDay(); this.days.push(day); }
     day[field] += 1;
+    if (field === "aiCalls") {
+      const month = day.date.slice(0, 7);
+      this.usageMonths[month] = (this.usageMonths[month] ?? 0) + 1;
+      void this.saveUsage().catch((error) => console.error("Usage save failed:", error));
+    }
     void this.saveStatistics().catch((error) => console.error("Statistics save failed:", error));
   }
 
@@ -317,13 +366,13 @@ export class DataStore {
     const count = Math.min(90, Math.max(1, Math.round(days)));
     const byDate = new Map(this.days.map((entry) => [entry.date, entry]));
     const result = recentDayKeys(count).map((date) => structuredClone(byDate.get(date) ?? emptyDay(date)));
-    return { today: structuredClone(byDate.get(dayKey()) ?? emptyDay()), days: result };
+    return { today: structuredClone(byDate.get(dayKey()) ?? emptyDay()), days: result, monthlyAiCalls: this.getCurrentMonthAiCalls() };
   }
 
   getCurrentMonthAiCalls(time = Date.now()): number {
     const date = new Date(time);
     const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
-    return this.days.filter((day) => day.date.startsWith(month)).reduce((sum, day) => sum + day.aiCalls, 0);
+    return this.usageMonths[month] ?? 0;
   }
 
   getProactiveCount(time = Date.now()): number {
@@ -346,6 +395,7 @@ export class DataStore {
       this.statisticsSaveTimer = null;
     }
     await this.saveStatistics();
+    await this.usageWriteChain;
     await this.chatWriteChain;
   }
 
@@ -353,7 +403,14 @@ export class DataStore {
     this.days = [];
     this.proactive = { date: dayKey(), count: 0 };
     this.lastSnapshot = null;
+    this.pendingUnknownSeconds = 0;
+    this.pendingUnknownProcess = "";
     await this.saveStatistics();
+  }
+
+  async clearUsage(): Promise<void> {
+    this.usageMonths = {};
+    await this.saveUsage();
   }
 
   async clearChats(): Promise<void> {

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { app, net, powerMonitor, screen } from "electron";
 import type { ActivitySnapshot, PerformanceSnapshot } from "../../src/types.js";
-import { categorize } from "../../src/shared/categorize.js";
+import { classifyBuiltin, resolvePresence } from "../../src/shared/activity.js";
 
 interface CpuTimes { idle: number; total: number; }
 interface SensorPayload extends Partial<ActivitySnapshot> { sensorMemoryMb?: number; }
@@ -29,7 +29,9 @@ function emptyPerformance(): PerformanceSnapshot {
 function blankSnapshot(): ActivitySnapshot {
   return {
     timestamp: Date.now(), foregroundProcess: "unknown", foregroundPath: "", windowTitle: "", documentTitle: "",
-    appCategory: "other", activeAppSeconds: 0, appSwitches5m: 0,
+    activityKind: "other", activityLabel: "其他", applicationLabel: "未知软件",
+    classificationSource: "fallback", classificationConfidence: 0, presenceState: "active",
+    activeAppSeconds: 0, appSwitches5m: 0,
     keyboardCount1s: 0, keyboardCount10s: 0, keyboardPulse: false,
     mouseClicks1s: 0, mouseClicks10s: 0, mouseClickPulse: false,
     mouseWheel1s: 0, mouseWheel10s: 0, mouseDistance1s: 0, mouseDistance10s: 0,
@@ -45,6 +47,8 @@ export class SensorService extends EventEmitter {
   private restartCount = 0;
   private locked = false;
   private stopped = false;
+  private running = false;
+  private powerEventsBound = false;
   private previousCursor = { x: 0, y: 0 };
   private fallbackDistances: number[] = [];
   private previousCpu = readCpuTimes();
@@ -52,9 +56,16 @@ export class SensorService extends EventEmitter {
   snapshot: ActivitySnapshot = blankSnapshot();
 
   start(): void {
-    powerMonitor.on("lock-screen", () => { this.locked = true; });
-    powerMonitor.on("unlock-screen", () => { this.locked = false; });
-    powerMonitor.on("resume", () => { this.locked = false; });
+    if (this.running) return;
+    this.running = true;
+    this.stopped = false;
+    this.restartCount = 0;
+    if (!this.powerEventsBound) {
+      this.powerEventsBound = true;
+      powerMonitor.on("lock-screen", () => { this.locked = true; });
+      powerMonitor.on("unlock-screen", () => { this.locked = false; });
+      powerMonitor.on("resume", () => { this.locked = false; });
+    }
     this.previousCursor = screen.getCursorScreenPoint();
     this.startNative();
   }
@@ -88,17 +99,18 @@ export class SensorService extends EventEmitter {
   private normalize(payload: SensorPayload): ActivitySnapshot {
     const base = blankSnapshot();
     const source = payload.sensorSource === "compat" ? "compat" : "native";
-    return {
+    const classification = classifyBuiltin(
+      String(payload.foregroundProcess || "unknown"),
+      String(payload.foregroundPath || ""),
+      String(payload.windowTitle || ""),
+      String(payload.documentTitle || "")
+    );
+    const snapshot: ActivitySnapshot = {
       ...base,
       ...payload,
       timestamp: Number(payload.timestamp) || Date.now(),
       foregroundProcess: String(payload.foregroundProcess || "unknown"),
-      appCategory: categorize(
-        String(payload.foregroundProcess || "unknown"),
-        String(payload.foregroundPath || ""),
-        String(payload.windowTitle || ""),
-        String(payload.documentTitle || "")
-      ),
+      ...classification,
       keyboardCount1s: Number(payload.keyboardCount1s) || 0,
       keyboardPulse: Boolean(payload.keyboardPulse || payload.keyboardCount1s),
       mouseClicks1s: Number(payload.mouseClicks1s) || 0,
@@ -109,10 +121,12 @@ export class SensorService extends EventEmitter {
       sensorSource: source,
       performance: this.performance(Number(payload.sensorMemoryMb) || 0)
     };
+    snapshot.presenceState = resolvePresence(snapshot);
+    return snapshot;
   }
 
   private startNative(): void {
-    if (this.stopped) return;
+    if (this.stopped || !this.running) return;
     const binary = this.binaryPath();
     if (!existsSync(binary)) { this.startFallback(); return; }
     this.child = spawn(binary, [], { windowsHide: true });
@@ -123,7 +137,7 @@ export class SensorService extends EventEmitter {
       if (ended) return;
       ended = true;
       if (this.child === child) this.child = null;
-      if (this.stopped) return;
+      if (this.stopped || !this.running) return;
       if (this.restartCount < 3) {
         const delay = 1000 * 2 ** this.restartCount++;
         setTimeout(() => this.startNative(), delay);
@@ -151,7 +165,7 @@ export class SensorService extends EventEmitter {
   }
 
   private startFallback(): void {
-    if (this.fallbackTimer) return;
+    if (this.stopped || !this.running || this.fallbackTimer) return;
     this.fallbackTimer = setInterval(() => {
       const cursor = screen.getCursorScreenPoint();
       const distance = Math.round(Math.hypot(cursor.x - this.previousCursor.x, cursor.y - this.previousCursor.y));
@@ -169,13 +183,18 @@ export class SensorService extends EventEmitter {
         idleSeconds: powerMonitor.getSystemIdleTime(), locked: this.locked,
         online: net.isOnline(), sensorSource: "fallback", performance: this.performance()
       };
+      this.snapshot.presenceState = resolvePresence(this.snapshot);
       this.emit("snapshot", this.snapshot);
     }, 1000);
   }
 
   stop(): void {
+    if (!this.running) return;
+    this.running = false;
     this.stopped = true;
     this.child?.kill();
+    this.child = null;
     if (this.fallbackTimer) clearInterval(this.fallbackTimer);
+    this.fallbackTimer = null;
   }
 }

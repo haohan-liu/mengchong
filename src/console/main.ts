@@ -1,6 +1,7 @@
 import "./styles.css";
-import animations from "../data/animations.json";
-import type { ActivitySnapshot, AnimationDefinition, PetRuntimeStatus, PetState, Settings, StatisticsSummary, UpdateStatus } from "../types";
+import animations from "../../animations_manifest.json";
+import type { ActivityKind, ActivityRule, ActivitySnapshot, AnimationDefinition, PetRuntimeStatus, PetState, Settings, StatisticsSummary, UpdateStatus } from "../types";
+import { activityGroups, activityLabels } from "../shared/activity";
 import { buttonLabel, escapeHtml, icon, safeAccent, sectionHeading, type IconName } from "./ui";
 import { formatCount, formatDuration } from "./format";
 
@@ -8,7 +9,6 @@ const recommendedAccents = [
   ["珊瑚红", "#e94f64"], ["蜜桃橙", "#e87955"], ["鸢尾紫", "#8267c7"],
   ["晴空蓝", "#4f7fce"], ["青瓷绿", "#3f9a86"], ["琥珀金", "#c88a32"]
 ] as const;
-const statisticCategories = ["design", "office", "development", "communication", "entertainment", "other"] as const;
 const stateActionMap: Record<PetState, string[]> = {
   BOOT: ["idle_breath"], APPEAR: ["wave_hello"], IDLE: ["idle_breath", "idle_blink", "idle_look_around"],
   LISTENING: ["listen"], USER_TYPING: ["user_typing", "type_fast"], THINKING: ["thinking", "loading"],
@@ -46,10 +46,12 @@ class ConsoleApp {
   private active = "home";
   private stats: StatisticsSummary | null = null;
   private statsRange = 30;
+  private activityRules: ActivityRule[] = [];
   private runtime!: PetRuntimeStatus;
   private updateStatus!: UpdateStatus;
   private onboardingOpen = false;
   private onboardingStep = 0;
+  private onboardingFinishTab: "home" | "ai" = "home";
   private activity!: ActivitySnapshot;
   private rangeSaveTimer = 0;
   private toastTimer = 0;
@@ -59,13 +61,16 @@ class ConsoleApp {
   private root = document.querySelector<HTMLElement>("#console-app")!;
 
   async mount(): Promise<void> {
-    [this.settings, this.stats, this.runtime, this.updateStatus] = await Promise.all([
-      window.petAPI.settings.get(), window.petAPI.statistics.get(31), window.petAPI.pet.getRuntime(), window.petAPI.updates.status()
+    [this.settings, this.stats, this.runtime, this.updateStatus, this.activityRules] = await Promise.all([
+      window.petAPI.settings.get(), window.petAPI.statistics.get(31), window.petAPI.pet.getRuntime(), window.petAPI.updates.status(), window.petAPI.activityRules.list()
     ]);
     this.onboardingOpen = !this.settings.firstRunConsent;
     this.activity = this.runtime.activity;
     const requestedTab = await window.petAPI.console.initialTab();
     if (tabs.some(([id]) => id === requestedTab)) this.active = requestedTab;
+    // First-run guidance always starts from the overview, rather than inheriting
+    // the last requested page (for example, the update notification page).
+    if (this.onboardingOpen) this.active = "home";
     this.render();
     window.petAPI.console.onNavigate((tab) => { if (tabs.some(([id]) => id === tab) && tab !== this.active) void this.openTab(tab); });
     window.petAPI.pet.onActivity((snapshot) => {
@@ -76,11 +81,13 @@ class ConsoleApp {
       const nameChanged = this.settings.petName !== settings.petName;
       const modeChanged=this.settings.manualMode!==settings.manualMode;
       const scheduledSilentChanged=this.settings.reminders.scheduledSilent!==settings.reminders.scheduledSilent;
+      const toolPermissionsChanged=JSON.stringify(this.settings.ai.toolPermissions)!==JSON.stringify(settings.ai.toolPermissions);
       this.settings = settings;
       // Most console text is intentionally generated from the name at render
       // time. Re-render only for a cross-window rename so every copy updates
       // together while preserving the current page and scroll position.
       if (nameChanged) { document.title = `${this.petNameText()}桌宠控制台`; this.render(true); return; }
+      if(toolPermissionsChanged&&this.active==='ai')this.syncToolPermissionControls(settings.ai.toolPermissions);
       if(this.active==='appearance')this.syncAppearanceScale();
       if(scheduledSilentChanged&&this.active==='reminders')this.syncScheduledSilentControls(settings.reminders.scheduledSilent);
       if(modeChanged)this.syncModeSelection();
@@ -160,11 +167,11 @@ class ConsoleApp {
     const aiUsed=this.monthlyAiUsage(),aiLimit=Math.max(0,this.settings.ai.monthlyLimit),aiRemaining=Math.max(0,aiLimit-aiUsed);
     const quickModes: ReadonlyArray<readonly [Settings['manualMode'], string, string, IconName]> = [
       ['auto', '自动陪伴', '自动识别节奏', 'sparkles'], ['dnd', '勿扰', '安静陪伴', 'moon'],
-      ['rest', '休息', '进入休息动作', 'coffee'], ['energy_saving', '节能模式', '降低动效开销', 'activity']
+      ['rest', '休息', '进入休息动作', 'coffee'], ['energy_saving', '节能模式', '暂停感知并降低动效开销', 'activity']
     ];
     const quickModeCards = quickModes.map(([value, label, description, iconName]) => `<button type="button" data-mode="${value}" class="quick-mode-card ${this.settings.manualMode===value?'selected':''}"><i class="quick-mode-icon">${icon(iconName)}</i><span><b>${label}</b><small>${description}</small></span>${this.settings.manualMode===value?`<em>${icon('check')} 当前</em>`:''}</button>`).join('');
     return `<article class="hero-card"><div class="hero-copy"><span class="status-pill"><i class="status-dot ${this.sensingActive()?'':'off'}"></i>当前状态 · <b data-live="sensor-source">${this.sensorSourceName()}</b></span><h2 data-live="mode-headline">${this.modeHeadline()}</h2><p><span data-live="foreground">${escapeHtml(this.foregroundLabel())}</span><span class="hero-separator">·</span><span data-live="typing">${this.typingLabel()}</span></p><div class="hero-actions"><button type="button" data-command="chat" class="primary">${buttonLabel('message','立即聊天')}</button><button type="button" data-command="toggle-sensing" class="sensing-toggle">${this.sensingControlLabel()}</button></div></div><div class="pet-showcase"><div class="pet-orb"><span class="orb-ring"></span><img data-showcase-pet src="./sprites/idle_breath/idle_breath_000.png" alt="${name}"></div><span class="companion-badge">${icon('heart')} <span data-live="mode-label">${this.modeLabel()}</span></span></div></article>
-      <div class="metric-grid">${this.metric('clock','今日专注',this.duration(today?.focusSeconds ?? 0),'有效工作时间')}${this.metric('keyboard','输入事件',`${this.compactCount(today?.inputEvents ?? 0)} 次`,'键盘、点击与滚轮次数')}${this.metric('coffee','休息完成',`${this.compactCount(today?.breaksCompleted ?? 0)} 次`,'今天的完成次数')}${this.metric('brain','AI 对话',`${this.compactCount(aiUsed)} 次`,`限额 ${this.compactCount(aiLimit)} 次 · 剩余 ${this.compactCount(aiRemaining)} 次`)}</div>
+      <div class="metric-grid">${this.metric('clock','今日生产力时间',this.duration(today?.productiveSeconds ?? 0),'生产力组细分活动')}${this.metric('keyboard','输入事件',`${this.compactCount(today?.inputEvents ?? 0)} 次`,'键盘、点击与滚轮次数')}${this.metric('coffee','休息完成',`${this.compactCount(today?.breaksCompleted ?? 0)} 次`,'今天的完成次数')}${this.metric('brain','AI 对话',`${this.compactCount(aiUsed)} 次`,`限额 ${this.compactCount(aiLimit)} 次 · 剩余 ${this.compactCount(aiRemaining)} 次`)}</div>
       <div class="two-col"><article class="card">${sectionHeading('感知健康','只统计活动信号，不读取输入内容')}<div class="health-list"><div class="health-row"><span>感知状态</span><b class="status-text ${this.sensingActive()?'ok':'warn'}" data-live="sensing-status">${this.sensingLabel()}</b></div><div class="health-row"><span>键盘事件（最近 1 秒）</span><b data-live="keyboard-rate">${this.activity.keyboardCount1s}</b></div><div class="health-row"><span>鼠标事件（最近 1 秒）</span><b data-live="mouse-rate">${this.activity.mouseClicks1s + this.activity.mouseWheel1s}</b></div><div class="health-row"><span>内容上下文</span><b>${this.settings.sensing.autoContext?'自动附带':'不发送'}</b></div></div></article><article class="card">${sectionHeading('电脑与桌宠性能','桌宠应用占用信息，关闭控制台会释放其渲染进程')}<div class="health-list"><div class="health-row"><span>系统 CPU / 内存</span><b><span data-live="system-cpu">${this.percent(performance.systemCpuPercent)}</span> / <span data-live="system-memory">${this.percent(performance.systemMemoryPercent)}</span></b></div><div class="health-row"><span>应用 CPU / 内存</span><b><span data-live="pet-cpu">${this.percent(performance.petCpuPercent)}</span> / <span data-live="pet-memory">${performance.petMemoryMb.toFixed(1)} MB</span></b></div><div class="health-row"><span>传感器内存</span><b data-live="sensor-memory">${performance.sensorMemoryMb ? `${performance.sensorMemoryMb.toFixed(1)} MB` : '基础降级层'}</b></div><div class="health-row"><span>进程 / 事件循环延迟</span><b><span data-live="pet-processes">${performance.petProcessCount}</span> / <span data-live="event-loop-lag">${performance.eventLoopLagMs} ms</span></b></div></div></article></div><article class="card compact-card quick-mode-section">${sectionHeading('快速模式',`一键切换${name}的陪伴节奏`)}<div class="quick-mode-grid">${quickModeCards}</div></article>`;
   }
 
@@ -186,7 +193,7 @@ class ConsoleApp {
     const summary = (state: PetState) => stateActionMap[state].map((id) => definitions.get(id)?.name ?? id).join(" / ");
     const modes: Array<[Settings["manualMode"], string, string]> = [
       ["auto", "自动", "自动识别切换"], ["dnd", "勿扰", "只安静陪伴"], ["rest", "休息", "进入休息动作"],
-      ["low_battery", "低电量", "模拟低电量状态"], ["energy_saving", "节能", "降低动画开销"], ["manual", "临时状态", this.manualCountdownLabel()]
+      ["low_battery", "低电量", "模拟低电量状态"], ["energy_saving", "节能", "暂停感知并降低动画开销"], ["manual", "临时状态", this.manualCountdownLabel()]
     ];
     const directionalDragPreviews = [
       ["dragged_left", "向左拖拽（镜像）", "拖到左侧时自动切换"],
@@ -204,35 +211,45 @@ class ConsoleApp {
     const name=this.petName();
     const rows:Array<[keyof typeof s,string,string]>=[['foregroundApp','前台应用','识别当前应用类别与持续时间'],['windowTitle','窗口与文档标题','仅在内存中使用'],['keyboardMouse','键鼠活动频率','绝不保存键值或文本'],['clipboard','剪贴板文本','仅随主动 AI 请求读取'],['selectedText','当前选中文本','通过 UI Automation 尝试读取，不模拟复制'],['meeting','会议状态','识别会议应用并静默'],['microphone','麦克风占用','只判断是否占用，不录音'],['power','电源和电量','低电量时切换状态'],['network','网络状态','断网时使用本地回复']];
     return `${!this.settings.firstRunConsent?`<article class="consent"><div class="consent-icon">${icon('shield')}</div><div><span class="eyebrow">隐私优先</span><h2>在启用内容感知前，请确认</h2><p>${name}不会记录具体按键、不会录音、不会截图。窗口标题、选中文本与剪贴板不会写入磁盘，只在你主动对话时按设置发送。</p></div><button type="button" data-command="consent" class="primary">${buttonLabel('check','我了解并同意启用')}</button></article>`:''}
-      <div class="two-col"><article class="card form-card">${sectionHeading('总开关','随时暂停或完全关闭本地感知')}${this.switcher("本地感知","enabled",s.enabled,"关闭后只保留基本动画和手动聊天",'sensing')}${this.switcher("自动附带当前上下文","autoContext",s.autoContext,"每次主动对话前展示并脱敏",'sensing')}<div class="button-cluster"><button type="button" data-command="pause-10">暂停 10 分钟</button><button type="button" data-command="pause-tomorrow">暂停到明天</button><button type="button" data-command="disable-sensing" class="danger-text">完全关闭</button></div></article>
+      <div class="two-col"><article class="card form-card">${sectionHeading('总开关','随时暂停或完全关闭本地感知')}${this.switcher("本地感知","enabled",s.enabled,"关闭后只保留基本动画和手动聊天",'sensing')}${this.switcher("自动附带当前上下文","autoContext",s.autoContext,"每次主动对话前展示并脱敏",'sensing')}${this.switcher("智能学习未知软件","smartActivityLearning",s.smartActivityLearning,"未知场景稳定 8 秒后才允许 AI 判断，并在本机复用",'sensing')}<div class="button-cluster"><button type="button" data-command="pause-10">暂停 10 分钟</button><button type="button" data-command="pause-tomorrow">暂停到明天</button><button type="button" data-command="disable-sensing" class="danger-text">完全关闭</button></div></article>
       <article class="card">${sectionHeading('实时感知诊断','数据随系统活动实时更新')}<div class="health-list"><div class="health-row"><span>数据来源</span><b data-live="sensor-source">${this.sensorSourceName()}</b></div><div class="health-row"><span>前台应用</span><b class="truncate" data-live="foreground">${escapeHtml(this.foregroundLabel())}</b></div><div class="health-row"><span>键盘（1 秒 / 10 秒）</span><b><span data-live="keyboard-rate">${this.activity.keyboardCount1s}</span> / <span data-live="keyboard-10s">${this.activity.keyboardCount10s}</span></b></div><div class="health-row"><span>鼠标点击与滚轮（1 秒）</span><b data-live="mouse-rate">${this.activity.mouseClicks1s + this.activity.mouseWheel1s}</b></div><div class="health-row"><span>系统空闲</span><b data-live="idle-seconds">${this.activity.idleSeconds} 秒</b></div></div><p class="diagnostic-note">${icon('lock')}这里只展示次数和结构化状态。传感器不会读取键码、按键内容、音频或屏幕图像。</p></article></div>
       <article class="card">${sectionHeading('感知项目',`逐项决定${name}能够读取的结构化状态`)}<div class="permission-list">${rows.map(([k,l,d])=>this.switcher(l,k,Boolean(s[k]),d,'sensing')).join('')}</div></article>
-      <div class="two-col"><article class="card form-card">${sectionHeading('内容黑名单','命中关键词时不读取上下文')}<textarea class="blacklist-input" data-list="blockedApps" placeholder="每行一个应用或标题关键词" aria-label="内容黑名单" spellcheck="false" autocapitalize="off">${escapeHtml(s.blockedApps.join('\n'))}</textarea></article><article class="card">${sectionHeading('上下文预览','发送给 AI 前可随时核对')}<pre class="context-preview">点击刷新查看当前将发送给 AI 的内容</pre><button type="button" data-command="context-preview" class="secondary full">${buttonLabel('eye','刷新预览')}</button></article></div>`;
+      <div class="two-col"><article class="card form-card">${sectionHeading('内容黑名单','命中关键词时不读取上下文')}<textarea class="blacklist-input" data-list="blockedApps" placeholder="每行一个应用或标题关键词" aria-label="内容黑名单" spellcheck="false" autocapitalize="off">${escapeHtml(s.blockedApps.join('\n'))}</textarea></article><article class="card">${sectionHeading('上下文预览','发送给 AI 前可随时核对')}<pre class="context-preview">点击刷新查看当前将发送给 AI 的内容</pre><button type="button" data-command="context-preview" class="secondary full">${buttonLabel('eye','刷新预览')}</button></article></div>${this.activityRulesCard()}`;
+  }
+
+  private activityRulesCard(): string {
+    const options=Object.entries(activityLabels) as Array<[string,string]>;
+    const rows=this.activityRules.map(rule=>`<div class="health-row activity-rule-row"><span><b>${escapeHtml(rule.applicationLabel)}</b><small>${escapeHtml(rule.processName)} · ${rule.source==='manual'?'用户规则':'AI 学习'} · 命中 ${rule.hitCount} 次 · ${new Date(rule.lastUsedAt).toLocaleDateString('zh-CN')}</small></span>${this.selectControl('rule',rule.id,rule.activityKind,options,`修改 ${rule.applicationLabel} 分类`)}<button type="button" data-rule-pin="${escapeHtml(rule.id)}">${rule.pinned?'已固定':'固定'}</button><button type="button" data-rule-delete="${escapeHtml(rule.id)}" class="danger-text">删除</button></div>`).join('');
+    return `<article class="card">${sectionHeading('本机学习规则','只保存规范化进程名、通用关键词和分类；不保存完整标题、路径或 URL')}<div class="health-list">${rows||'<p class="storage-summary">还没有学习规则。未知软件会先使用本地规则，必要时才询问 AI。</p>'}</div><button type="button" data-command="clear-activity-rules" class="danger-text full">${buttonLabel('trash','独立清除全部学习规则')}</button></article>`;
   }
 
   private reminders(): string { const r=this.settings.reminders; return `<div class="two-col"><article class="card form-card">${sectionHeading('工作节奏','用温和提醒保持专注与休息平衡')}${this.number("专注时长","focusMinutes",r.focusMinutes,"分钟")}${this.number("休息时长","breakMinutes",r.breakMinutes,"分钟")}${this.number("饮水间隔","hydrationMinutes",r.hydrationMinutes,"分钟")}${this.number("主动陪伴冷却","proactiveCooldownMinutes",r.proactiveCooldownMinutes,"分钟")}${this.number("每日主动次数","proactiveDailyLimit",r.proactiveDailyLimit,"次")}</article><article class="card form-card">${sectionHeading('静默与启动','静默期间停止自动状态切换与主动打扰；手动聊天仍可使用')}${this.switcher("定时静默","scheduledSilent",r.scheduledSilent,"开启后，才会按下方时间进入静默",'reminder')}${this.timePicker("静默开始","quietStart",r.quietStart,!r.scheduledSilent)}${this.timePicker("静默结束","quietEnd",r.quietEnd,!r.scheduledSilent)}${this.switcher("会议时静默","meetingSilent",r.meetingSilent,"检测到会议时不主动打扰",'reminder')}${this.switcher("全屏时静默","fullscreenSilent",r.fullscreenSilent,"演示和视频时保持安静",'reminder')}${this.switcher("Windows 自启动","autostart",r.autostart,"登录后延迟显示",'reminder')}${this.number("启动延迟","startupDelaySeconds",r.startupDelaySeconds,"秒")}</article></div>`; }
 
   private ai(): string {
     const a=this.settings.ai, used=this.monthlyAiUsage(), remaining=Math.max(0,a.monthlyLimit-used);
-    return `<div class="two-col"><article class="card form-card ai-config-card">${sectionHeading('DeepSeek API 配置','配置 API Key 后才可使用在线智能对话')}<label><span class="field-label">DeepSeek API 地址</span><div class="locked-url-row"><input data-base-url readonly value="${escapeHtml(a.baseUrl)}" spellcheck="false" aria-label="DeepSeek API 地址"><button type="button" data-command="edit-base-url" class="field-edit-button" aria-label="编辑 DeepSeek API 地址" title="编辑 API 地址">${buttonLabel('edit','编辑')}</button></div><small class="field-help">默认使用 DeepSeek 官方接口。为防止误触，只有点击“编辑”后才能修改。</small></label>${this.select("模型","model",a.model,[["deepseek-v4-flash","V4 Flash · 快速"],["deepseek-v4-pro","V4 Pro · 高质量"]],"ai")}<label><span class="field-label">API Key</span><div class="secret-row"><input type="password" class="api-key" placeholder="输入 DeepSeek API Key 后安全保存" autocomplete="off"><button type="button" data-command="save-key" class="secondary">${buttonLabel('key','安全保存')}</button></div></label>${this.number("月度调用上限","monthlyLimit",a.monthlyLimit,"次",'ai')}<button type="button" data-command="test-ai" class="primary full">${buttonLabel('activity','测试连接')}</button><p class="connection-result inline-result" aria-live="polite"></p></article><article class="card form-card">${sectionHeading('对话与问候','控制推理、上下文和桌面气泡文案')}${this.switcher("AI 智能问候文案","smartCompanionSpeech",a.smartCompanionSpeech,"开启且 API 可用时批量生成临时、不重复的点击与主动问候；否则使用内置文案",'ai')}${this.switcher("深度思考","deepThinking",a.deepThinking,"复杂任务使用更强推理",'ai')}${this.switcher("自动附带当前上下文","includeContext",a.includeContext,"遵循感知页的黑名单和脱敏规则",'ai')}<div class="ai-quota"><div>${icon('brain')}<span><b>本月调用上限</b><small>已用 ${this.compactCount(used)} 次 · 剩余 ${this.compactCount(remaining)} 次</small></span></div><strong>${this.compactCount(a.monthlyLimit)} 次</strong></div><button type="button" data-command="clear-chats" class="danger-text full">${buttonLabel('trash','清空本地聊天历史')}</button></article></div><article class="card permission-card">${sectionHeading('工具权限','每项下拉框直接控制对应工具的执行方式')}<div class="permission-explainer">${icon('shield')}<div><b>这两个权限确实参与执行</b><p>“每次询问”会在工具真正调用时弹出确认；“直接允许”跳过该次确认；“禁止使用”会在执行层直接拒绝。</p></div></div><div class="permission-controls">${this.permissionControl('打开网页','open_url',a.toolPermissions.open_url,'仅允许打开 HTTP/HTTPS 链接')}${this.permissionControl('读取当前上下文','read_current_context',a.toolPermissions.read_current_context,'仅返回已脱敏的临时上下文')}<div class="permission-control locked"><div><b>启动应用</b><small>应用白名单尚未配置，因此执行层固定拒绝</small></div><span>${icon('lock')} 暂未开放</span></div></div><div class="fixed-policy"><b>固定安全策略</b><p><span><i class="permission-dot safe"></i>提醒、计时器、动作、通知和打开控制台可直接执行</span><span><i class="permission-dot never"></i>Shell、任意命令、文件写入与删除永不开放</span></p></div></article>`;
+    return `<article class="card chat-entry-card"><div class="chat-entry-copy">${icon('message')}<span><b>智能体聊天台</b><small>有问题或需要帮忙时，随时来和${escapeHtml(this.petName())}聊聊</small></span></div><button type="button" data-command="chat" class="primary">${buttonLabel('message','打开聊天台')}</button></article><div class="two-col"><article class="card form-card ai-config-card">${sectionHeading('DeepSeek API 配置','配置 API Key 后才可使用在线智能对话')}<label><span class="field-label">DeepSeek API 地址</span><div class="locked-url-row"><input data-base-url readonly value="${escapeHtml(a.baseUrl)}" spellcheck="false" aria-label="DeepSeek API 地址"><button type="button" data-command="edit-base-url" class="field-edit-button" aria-label="编辑 DeepSeek API 地址" title="编辑 API 地址">${buttonLabel('edit','编辑')}</button></div><small class="field-help">默认使用 DeepSeek 官方接口。为防止误触，只有点击“编辑”后才能修改。</small></label>${this.select("模型","model",a.model,[["deepseek-v4-flash","V4 Flash · 快速"],["deepseek-v4-pro","V4 Pro · 高质量"]],"ai")}<label><span class="field-label">API Key</span><div class="secret-row"><input type="password" class="api-key" placeholder="输入 DeepSeek API Key 后安全保存" autocomplete="off"><button type="button" data-command="save-key" class="secondary">${buttonLabel('key','安全保存')}</button></div></label>${this.number("月度调用上限","monthlyLimit",a.monthlyLimit,"次",'ai')}<button type="button" data-command="test-ai" class="primary full">${buttonLabel('activity','测试连接')}</button><p class="connection-result inline-result" aria-live="polite"></p></article><article class="card form-card">${sectionHeading('对话与问候','控制推理、上下文和桌面气泡文案')}${this.switcher("AI 智能问候文案","smartCompanionSpeech",a.smartCompanionSpeech,"开启且 API 可用时批量生成临时、不重复的点击与主动问候；否则使用内置文案",'ai')}${this.switcher("深度思考","deepThinking",a.deepThinking,"复杂任务使用更强推理",'ai')}${this.switcher("自动附带当前上下文","includeContext",a.includeContext,"遵循感知页的黑名单和脱敏规则",'ai')}<div class="ai-quota"><div>${icon('brain')}<span><b>本月调用上限</b><small>已用 ${this.compactCount(used)} 次 · 剩余 ${this.compactCount(remaining)} 次</small></span></div><strong>${this.compactCount(a.monthlyLimit)} 次</strong></div><button type="button" data-command="clear-chats" class="danger-text full">${buttonLabel('trash','清空本地聊天历史')}</button></article></div><article class="card permission-card">${sectionHeading('工具权限','每项下拉框直接控制对应工具的执行方式')}<div class="permission-explainer">${icon('shield')}<div><b>三个权限都会在执行层实时生效</b><p>“每次询问”会对每一次真实工具调用弹出确认；“直接允许”跳过确认；“禁止使用”会直接拒绝。聊天台中的快速授权也会立即同步到这里。</p></div></div><div class="permission-controls">${this.permissionControl('打开网页','open_url',a.toolPermissions.open_url,'使用临时浏览器查询，结束后自动关闭并返回结果')}${this.permissionControl('启动应用','launch_app',a.toolPermissions.launch_app,'仅支持记事本、计算器、画图、资源管理器和系统设置')}${this.permissionControl('读取当前上下文','read_current_context',a.toolPermissions.read_current_context,'仅返回已脱敏的临时上下文')}</div><div class="fixed-policy"><b>固定安全策略</b><p><span><i class="permission-dot safe"></i>提醒、动作、通知和打开控制台可直接执行</span><span><i class="permission-dot never"></i>Shell、任意命令、文件写入与删除永不开放</span></p></div></article>`;
   }
 
   private statistics(): string {
     const days=this.stats?.days??[];
     const max=Math.max(1,...days.map(d=>d.activeSeconds));
-    const total=days.reduce((result,day)=>({active:result.active+day.activeSeconds,focus:result.focus+day.focusSeconds,input:result.input+day.inputEvents,switches:result.switches+day.appSwitches,ai:result.ai+day.aiCalls,local:result.local+day.localReplies}),{active:0,focus:0,input:0,switches:0,ai:0,local:0});
+    const total=days.reduce((result,day)=>({active:result.active+day.activeSeconds,rest:result.rest+day.restSeconds,productive:result.productive+day.productiveSeconds,input:result.input+day.inputEvents,switches:result.switches+day.appSwitches,ai:result.ai+day.aiCalls,local:result.local+day.localReplies}),{active:0,rest:0,productive:0,input:0,switches:0,ai:0,local:0});
     const categoryTotals=days.reduce<Record<string,number>>((result,day)=>{for(const [key,value] of Object.entries(day.categories))result[key]=(result[key]??0)+Number(value);return result},{});
     const rangeLabel=this.statsRange===1?'今天':`近 ${this.statsRange} 天`;
     const refreshAction=`<button type="button" data-command="refresh-stats">${buttonLabel('refresh','刷新')}</button>`;
+    const groups=[...activityGroups.map(group=>({label:group.label,value:group.kinds.reduce((sum,kind)=>sum+(categoryTotals[kind]??0),0)})),{label:'休息',value:total.rest}].map(group=>{
+      const percent=Math.min(100,group.value/Math.max(1,total.active+total.rest)*100);
+      return `<div class="category-row"><span class="category-name">${escapeHtml(group.label)}</span><span class="bar-track" tabindex="0"><i style="width:${percent}%"></i><span class="category-tooltip">${this.duration(group.value)} · 占记录时长 ${percent.toFixed(1)}%</span></span><b>${this.duration(group.value)}</b></div>`;
+    }).join('');
     return `<article class="card stats-toolbar"><div>${sectionHeading('统计范围','活跃时间按每秒去重；输入事件只累计次数，不保存内容')}</div><div class="range-tabs" role="group" aria-label="统计范围">${[1,3,7,30].map(value=>`<button type="button" data-stats-range="${value}" class="${this.statsRange===value?'selected':''}" aria-pressed="${this.statsRange===value}">${value===1?'今天':`${value} 天`}</button>`).join('')}</div></article>
-      <div class="metric-grid">${this.metric('activity',`${rangeLabel}活跃`,this.duration(total.active),'系统空闲小于 60 秒')}${this.metric('clock',`${rangeLabel}专注`,this.duration(total.focus),'设计 / 办公 / 开发')}${this.metric('keyboard','输入事件',`${this.compactCount(total.input)} 次`,'键盘、点击与滚轮次数')}${this.metric('refresh','应用切换',`${this.compactCount(total.switches)} 次`,'前台进程变化')}</div>
-      <article class="card chart-card">${sectionHeading(`${rangeLabel}活跃趋势`,'每天的聚合活跃时长；悬浮柱状图查看详情',refreshAction)}<div class="chart-grid-lines" aria-hidden="true"><i></i><i></i><i></i></div><div class="bar-chart ${days.length>14?'dense':''}" role="img" aria-label="${rangeLabel}活跃趋势柱状图">${days.length?days.map(d=>{const height=d.activeSeconds?Math.max(3,d.activeSeconds/max*100):0;return `<div class="chart-column" tabindex="0" style="--bar-height:${height}%"><span class="chart-tooltip"><b>${escapeHtml(d.date)}</b><small>活跃 ${this.duration(d.activeSeconds)}</small><small>专注 ${this.duration(d.focusSeconds)} · 输入 ${this.compactCount(d.inputEvents)}</small></span><i></i><small class="chart-date">${escapeHtml(d.date.slice(5))}</small></div>`}).join(''):`<div class="empty-chart">${icon('chart')}<b>暂无统计数据</b><small>使用一段时间后，趋势会显示在这里</small></div>`}</div></article>
-      <div class="two-col"><article class="card">${sectionHeading(`${rangeLabel}应用类别`,'根据进程名与窗口标题实时归类，新产生的数据会进入对应类别')}<div class="category-bars">${statisticCategories.map(key=>{const value=categoryTotals[key]??0,percent=Math.min(100,value/Math.max(1,total.active)*100);return `<div class="category-row"><span class="category-name">${escapeHtml(this.categoryName(key))}</span><span class="bar-track" tabindex="0"><i style="width:${percent}%"></i><span class="category-tooltip">${this.duration(value)} · 占活跃 ${percent.toFixed(1)}%</span></span><b>${this.duration(value)}</b></div>`}).join('')}</div></article><article class="card">${sectionHeading('陪伴与 AI','本地与在线回复概况')}<div class="health-list"><div class="health-row"><span>AI 调用</span><b>${this.compactCount(total.ai)} 次</b></div><div class="health-row"><span>本地降级回复</span><b>${this.compactCount(total.local)} 次</b></div><div class="health-row"><span>当前应用识别</span><b>${escapeHtml(this.categoryName(this.activity.appCategory))}</b></div><div class="health-row"><span>统计最后刷新</span><b>${new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}</b></div></div></article></div>`;
+      <div class="metric-grid">${this.metric('activity',`${rangeLabel}活跃`,this.duration(total.active),'暂离与休息不累计')}${this.metric('clock',`${rangeLabel}生产力`,this.duration(total.productive),'生产力组 9 个细分状态')}${this.metric('keyboard','输入事件',`${this.compactCount(total.input)} 次`,'键盘、点击与滚轮次数')}${this.metric('refresh','应用切换',`${this.compactCount(total.switches)} 次`,'前台进程变化')}</div>
+      <article class="card chart-card">${sectionHeading(`${rangeLabel}活跃趋势`,'每天的聚合活跃时长；悬浮柱状图查看详情',refreshAction)}<div class="chart-grid-lines" aria-hidden="true"><i></i><i></i><i></i></div><div class="bar-chart ${days.length>14?'dense':''}" role="img" aria-label="${rangeLabel}活跃趋势柱状图">${days.length?days.map(d=>{const height=d.activeSeconds?Math.max(3,d.activeSeconds/max*100):0;return `<div class="chart-column" tabindex="0" style="--bar-height:${height}%"><span class="chart-tooltip"><b>${escapeHtml(d.date)}</b><small>活跃 ${this.duration(d.activeSeconds)}</small><small>生产力 ${this.duration(d.productiveSeconds)} · 输入 ${this.compactCount(d.inputEvents)}</small></span><i></i><small class="chart-date">${escapeHtml(d.date.slice(5))}</small></div>`}).join(''):`<div class="empty-chart">${icon('chart')}<b>暂无统计数据</b><small>使用一段时间后，趋势会显示在这里</small></div>`}</div></article>
+      <div class="two-col"><article class="card category-summary">${sectionHeading(`${rangeLabel}活动分类`,'仅按大组汇总；细分状态仍会独立记录')}<div class="category-bars">${groups}</div></article><article class="card">${sectionHeading('陪伴与 AI','本地与在线回复概况')}<div class="health-list"><div class="health-row"><span>本月 AI 调用</span><b>${this.compactCount(this.stats?.monthlyAiCalls??0)} 次</b></div><div class="health-row"><span>本地降级回复</span><b>${this.compactCount(total.local)} 次</b></div><div class="health-row"><span>当前应用识别</span><b>${escapeHtml(`${this.activity.applicationLabel} · ${this.activity.activityLabel}`)}</b></div><div class="health-row"><span>识别来源</span><b>${escapeHtml(this.activity.classificationSource)}</b></div></div></article></div>`;
   }
 
   private storage(): string {
     const currentDirectory=this.settings.dataDirectory;
-    return `<div class="two-col"><article class="card form-card">${sectionHeading('数据位置','管理聚合统计与聊天记录的本地目录')}<label><span class="field-label">当前目录</span><div class="read-only-field">${icon('folder')}<input readonly value="${escapeHtml(currentDirectory)}" title="${escapeHtml(currentDirectory)}"></div></label><p class="info-note">${icon('shield')}迁移会复制并校验数据，成功后删除旧目录，最终只保留一个数据位置。其他电脑首次安装会自动使用各自 Windows 账户的应用数据目录，不会继承开发电脑的路径。</p><button type="button" data-command="choose-directory" class="primary full">${buttonLabel('folder','选择新的存储文件夹')}</button></article><article class="card">${sectionHeading('数据保留','每日聚合默认保留 90 天')}<p class="storage-summary">窗口标题、剪贴板和选中文本不会写入磁盘。API Key 留在 Windows DPAPI 加密存储中。下方操作无法撤销，执行前会再次确认。</p><div class="danger-zone"><button type="button" data-command="clear-stats">${buttonLabel('trash','清空统计')}<small>删除全部本地聚合统计</small></button><button type="button" data-command="clear-chats">${buttonLabel('trash','清空聊天')}<small>删除全部本地聊天记录</small></button><button type="button" data-command="reset-all" class="danger">${buttonLabel('rotate','恢复全部默认设置')}<small>清空数据并重置所有偏好</small></button></div></article></div>`;
+    return `<div class="two-col"><article class="card form-card">${sectionHeading('数据位置','管理聚合统计、聊天与本机学习库')}<label><span class="field-label">当前目录</span><div class="read-only-field">${icon('folder')}<input readonly value="${escapeHtml(currentDirectory)}" title="${escapeHtml(currentDirectory)}"></div></label><p class="info-note">${icon('shield')}迁移会复制并校验数据，成功后删除旧目录。每台电脑独立学习，不会自动联网同步。</p><button type="button" data-command="choose-directory" class="primary full">${buttonLabel('folder','选择新的存储文件夹')}</button></article><article class="card">${sectionHeading('数据保留','每日聚合默认保留 90 天')}<p class="storage-summary">本机规则不保存完整路径、窗口标题、文档名或 URL。API Key 使用 Windows DPAPI 加密。下方操作执行前会再次确认。</p><div class="danger-zone"><button type="button" data-command="clear-stats">${buttonLabel('trash','清空统计')}<small>保留独立的本月 API 用量</small></button><button type="button" data-command="clear-chats">${buttonLabel('trash','清空聊天')}<small>删除全部本地聊天记录</small></button><button type="button" data-command="clear-activity-rules">${buttonLabel('trash','清除学习规则')}<small>保留统计、聊天、设置与 API Key</small></button><button type="button" data-command="reset-all" class="danger">${buttonLabel('rotate','恢复全部默认')}<small>删除数据、API Key、授权与所有设置</small></button><button type="button" data-command="clear-all" class="danger">${buttonLabel('trash','清除全部本地数据')}<small>清理安全标记目录并重启应用</small></button></div></article></div>`;
   }
 
   private updatesPage():string{
@@ -248,18 +265,21 @@ class ConsoleApp {
   private onboarding():string{
     if(!this.onboardingOpen)return '';
     const firstRun=!this.settings.firstRunConsent;
+    const configuringApi=this.onboardingFinishTab==='ai';
     const steps=[
       {icon:'heart' as IconName,kicker:'快速认识',title:`欢迎使用${this.petNameText()}`,body:`${this.petNameText()}会常驻桌面。拖动可调整位置，点击可以互动；右键桌宠或使用托盘菜单，可以打开聊天、控制台以及退出程序。Windows 自启动已默认开启，登录后会自动出现。`},
       {icon:'shield' as IconName,kicker:'隐私确认',title:'本地感知由你决定',body:'它只读取工作节奏等结构化活动信号，不读取具体按键、不录音、不截图。你可以现在开启，也可以保持关闭后再到“感知与隐私”逐项设置。'},
       {icon:'brain' as IconName,kicker:'智能对话',title:'建议优先接入 DeepSeek API',body:'API Key 是在线聊天、智能问候和内容感知增强的关键。未接入时只能使用本地回复；你可先申请 Key，再进入“智能体 API”安全保存并测试连接。Key 会由当前 Windows 账户加密保存。'},
-      {icon:'check' as IconName,kicker:'准备完成',title:'现在可以开始使用了',body:'本地陪伴、动作与统计可以直接使用；DeepSeek 对话、隐私范围和更新入口都可以随时在控制台中调整。'}
+      configuringApi
+        ? {icon:'key' as IconName,kicker:'准备配置',title:'API 配置页已经打开',body:'点击完成后即可在当前页面粘贴并安全保存 API Key；配置完成后可直接测试连接。'}
+        : {icon:'check' as IconName,kicker:'准备完成',title:'现在可以开始使用了',body:'本地陪伴、动作与统计可以直接使用；DeepSeek 对话、隐私范围和更新入口都可以随时在控制台中调整。'}
     ];
     const step=steps[this.onboardingStep]??steps[0]!;
     let primaryActions='';
     if(this.onboardingStep===0)primaryActions='<button type="button" data-onboarding-next class="tour-primary">开始了解</button>';
     if(this.onboardingStep===1)primaryActions='<button type="button" data-command="onboarding-private" class="tour-secondary">暂不开启</button><button type="button" data-command="onboarding-enable" class="tour-primary">同意并开启</button>';
     if(this.onboardingStep===2)primaryActions='<button type="button" data-command="onboarding-ai-later" class="tour-secondary">稍后配置</button><button type="button" data-command="onboarding-open-ai" class="tour-primary">去配置 API Key</button>';
-    if(this.onboardingStep===3)primaryActions='<button type="button" data-command="finish-onboarding" class="tour-primary">进入控制台</button>';
+    if(this.onboardingStep===3)primaryActions=`<button type="button" data-command="finish-onboarding" class="tour-primary">${configuringApi?'继续配置 API Key':'进入控制台'}</button>`;
     return `<div class="tour-mask tour-step-${this.onboardingStep}" data-onboarding role="dialog" aria-modal="true" aria-labelledby="onboarding-title"><div class="tour-spotlight" aria-hidden="true"></div><section class="tour-card"><header><span class="tour-icon">${icon(step.icon)}</span><div><span class="eyebrow">${escapeHtml(step.kicker)}</span><h2 id="onboarding-title">${escapeHtml(step.title)}</h2></div><span class="tour-count">${this.onboardingStep+1} / ${steps.length}</span></header><p>${escapeHtml(step.body)}</p>${this.onboardingStep===2?'<div class="tour-api-note"><b>关键配置</b><span>申请并保存 DeepSeek API Key</span><small>在线聊天与内容感知增强均依赖 API</small><button type="button" data-command="open-deepseek-api-signup" class="tour-api-link">前往申请</button></div>':''}<footer>${!firstRun?'<button type="button" data-onboarding-close class="tour-quiet">关闭指引</button>':''}${this.onboardingStep>0?'<button type="button" data-onboarding-prev class="tour-quiet">上一步</button>':''}<span class="tour-action-group">${primaryActions}</span></footer><div class="tour-progress">${steps.map((_,index)=>`<i class="${index<=this.onboardingStep?'active':''}"></i>`).join('')}</div></section></div>`;
   }
 
@@ -332,7 +352,7 @@ class ConsoleApp {
     const section=scope==='reminder'?'reminders':scope;
     return `<div class="switch-row"><span><b>${escapeHtml(label)}</b><small>${escapeHtml(description)}</small></span><button type="button" class="switch-control ${value?'checked':''}" role="switch" aria-checked="${value}" aria-label="${escapeHtml(label)}" data-switch-section="${escapeHtml(section)}" data-switch-key="${escapeHtml(key)}"><i aria-hidden="true"></i></button></div>`;
   }
-  private permissionControl(label:string,key:'open_url'|'read_current_context',value:'ask'|'allow'|'deny',description:string):string {
+  private permissionControl(label:string,key:'open_url'|'launch_app'|'read_current_context',value:'ask'|'allow'|'deny',description:string):string {
     const state=({ask:'每次询问',allow:'直接允许',deny:'禁止使用'} as const)[value];
     return `<div class="permission-control"><div class="permission-title"><b>${escapeHtml(label)}</b><em class="permission-state state-${value}">${state}</em><small>${escapeHtml(description)}</small></div>${this.selectControl('tool',key,value,[["ask","每次询问（推荐）"],["allow","直接允许"],["deny","禁止使用"]],`${label}权限`)}</div>`;
   }
@@ -349,7 +369,7 @@ class ConsoleApp {
   }
   private duration(seconds:number):string{return formatDuration(seconds)}
   private compactCount(value:number):string{return formatCount(value)}
-  private monthlyAiUsage():number { const now=new Date(),month=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;return (this.stats?.days??[]).filter(day=>day.date.startsWith(month)).reduce((sum,day)=>sum+day.aiCalls,0) }
+  private monthlyAiUsage():number { return this.stats?.monthlyAiCalls??0 }
   private modeLabel():string{return ({auto:'陪伴中',dnd:'勿扰中',rest:'休息中',energy_saving:'节能中',low_battery:'低电量模拟',manual:'临时状态'} as Record<string,string>)[this.settings.manualMode]??'陪伴中'}
   private modeHeadline():string{const name=this.petName();return ({auto:`${name}正在你身边`,dnd:`${name}正在安静陪伴`,rest:`${name}正在休息`,energy_saving:`${name}已进入节能模式`,low_battery:`${name}正在模拟低电量`,manual:`${name}正在体验临时状态`} as Record<string,string>)[this.settings.manualMode]??`${name}正在你身边`}
   private stateDescription(s:PetState):string{return ({BOOT:'启动',APPEAR:'出现',IDLE:'待机',LISTENING:'倾听',USER_TYPING:'输入',THINKING:'思考',RESPONDING:'回答',SUCCESS:'成功',ERROR:'错误',OFFLINE:'离线',LOW_BATTERY:'低电量',SLEEP:'睡眠',DRAGGING:'拖拽',REACTION:'互动',DISAPPEAR:'离开'} as Record<string,string>)[s] ?? s}
@@ -399,9 +419,9 @@ class ConsoleApp {
   private bind(): void {
     this.root.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,()=>this.openTab(el.dataset.tab!))));
     this.root.querySelector(".close-window")?.addEventListener("click",()=>void window.petAPI.console.close());
-    this.root.querySelector<HTMLButtonElement>('[data-onboarding-next]')?.addEventListener('click',()=>{this.onboardingStep=Math.min(3,this.onboardingStep+1);this.render()});
-    this.root.querySelector<HTMLButtonElement>('[data-onboarding-prev]')?.addEventListener('click',()=>{this.onboardingStep=Math.max(0,this.onboardingStep-1);this.render()});
-    this.root.querySelector<HTMLButtonElement>('[data-onboarding-close]')?.addEventListener('click',()=>{this.onboardingOpen=false;this.render(true)});
+    this.root.querySelector<HTMLButtonElement>('[data-onboarding-next]')?.addEventListener('click',()=>this.showOnboardingStep(1,'privacy'));
+    this.root.querySelector<HTMLButtonElement>('[data-onboarding-prev]')?.addEventListener('click',()=>this.showOnboardingStep(Math.max(0,this.onboardingStep-1),this.onboardingStep<=1?'home':this.onboardingStep===2?'privacy':'ai'));
+    this.root.querySelector<HTMLButtonElement>('[data-onboarding-close]')?.addEventListener('click',()=>{this.onboardingOpen=false;this.onboardingFinishTab='home';this.render(true)});
     this.root.querySelectorAll<HTMLInputElement>("[data-appearance]").forEach(el=>{
       const update=async()=>{await this.updateNested('appearance',el.dataset.appearance!,this.value(el));this.notify('外观设置已保存')};
       if(el instanceof HTMLInputElement&&el.type==='range')el.addEventListener('input',()=>{
@@ -439,10 +459,25 @@ class ConsoleApp {
     this.root.querySelectorAll<HTMLButtonElement>("[data-select-value]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,async()=>{
       const section=el.dataset.selectSection!,key=el.dataset.selectKey!,value=el.dataset.selectValue!;
       if(section==='tool'){
-        this.settings.ai.toolPermissions[key as 'open_url'|'read_current_context']=value as 'ask'|'allow'|'deny';
-        await this.save();
+        const permissionKey=key as 'open_url'|'launch_app'|'read_current_context';
+        const next=value as 'ask'|'allow'|'deny',previous=this.settings.ai.toolPermissions[permissionKey];
+        this.settings.ai.toolPermissions[permissionKey]=next;
+        this.syncToolPermissionControl(permissionKey,next);
+        try{this.settings=await window.petAPI.settings.update(this.settings)}
+        catch{
+          this.settings.ai.toolPermissions[permissionKey]=previous;
+          this.syncToolPermissionControl(permissionKey,previous);
+          this.notify('工具权限保存失败，请重试',true);
+          return;
+        }
+        this.notify('工具权限已经更新');
+        return;
+      }
+      if(section==='rule'){
+        await window.petAPI.activityRules.update(key,{activityKind:value as ActivityKind,pinned:true});
+        this.activityRules=await window.petAPI.activityRules.list();
         this.render(true);
-        this.notify('工具权限已更新并立即生效');
+        this.notify('规则已修改并固定为用户规则');
         return;
       }
       if(section==='appearance'||section==='sensing'||section==='reminders'||section==='ai')await this.updateNested(section,key,value);
@@ -452,6 +487,8 @@ class ConsoleApp {
     this.root.querySelectorAll<HTMLButtonElement>("[data-theme]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,async()=>{await this.updateNested('appearance','theme',el.dataset.theme!);this.render(true);this.notify('控制台主题已更新')})));
     this.root.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,async()=>{const mode=el.dataset.mode as Settings['manualMode'];this.settings.manualMode=mode;if(mode==='manual'){this.settings.manualState=this.runtime.state;this.settings.manualUntil=Date.now()+30_000}else{this.settings.manualState=null;this.settings.manualUntil=null}await this.save();this.runtime=await window.petAPI.pet.getRuntime();this.syncModeSelection();this.syncManualCountdown();this.updateLiveValues();this.notify('陪伴模式已切换')})));
     this.root.querySelectorAll<HTMLButtonElement>("[data-action]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,async()=>{const ok=await window.petAPI.pet.setAction(el.dataset.action!);this.runtime=await window.petAPI.pet.getRuntime();this.notify(ok?'动作已发送给桌宠':'动作资源不可用',!ok)})));
+    this.root.querySelectorAll<HTMLButtonElement>("[data-rule-pin]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,async()=>{await window.petAPI.activityRules.update(el.dataset.rulePin!,{pinned:true});this.activityRules=await window.petAPI.activityRules.list();this.render(true);this.notify('规则已固定为用户规则')})));
+    this.root.querySelectorAll<HTMLButtonElement>("[data-rule-delete]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,async()=>{await window.petAPI.activityRules.delete(el.dataset.ruleDelete!);this.activityRules=await window.petAPI.activityRules.list();this.render(true);this.notify('规则已删除')})));
     this.root.querySelectorAll<HTMLButtonElement>("[data-state]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,async()=>{const ok=await window.petAPI.pet.setState(el.dataset.state!);this.runtime=await window.petAPI.pet.getRuntime();if(ok)this.syncStateSelection(el);this.updateLiveValues();this.notify(ok?'状态与对应动作已触发，将保持 30 秒':'状态不可用',!ok)})));
     this.root.querySelectorAll<HTMLButtonElement>("[data-command]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,()=>this.command(el.dataset.command!))));
     this.root.querySelectorAll<HTMLButtonElement>("[data-stats-range]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,async()=>{this.statsRange=Number(el.dataset.statsRange)||30;await this.refreshStatistics(true)})));
@@ -531,6 +568,37 @@ class ConsoleApp {
     if(!except?.classList.contains('color-picker'))this.previewAccent(this.settings.appearance.accentColor);
   }
 
+  private syncToolPermissionControls(permissions:Settings['ai']['toolPermissions']):void{
+    (Object.keys(permissions) as Array<'open_url'|'launch_app'|'read_current_context'>).forEach(key=>this.syncToolPermissionControl(key,permissions[key]));
+  }
+
+  private syncToolPermissionControl(key:'open_url'|'launch_app'|'read_current_context',value:'ask'|'allow'|'deny'):void{
+    const options=[...this.root.querySelectorAll<HTMLButtonElement>(`[data-select-section="tool"][data-select-key="${key}"]`)];
+    const selected=options.find(option=>option.dataset.selectValue===value);
+    if(!selected)return;
+    options.forEach(option=>{
+      const active=option===selected;
+      option.classList.toggle('selected',active);
+      option.setAttribute('aria-selected',String(active));
+      option.querySelector('.ui-icon')?.remove();
+      if(active)option.insertAdjacentHTML('beforeend',icon('check'));
+    });
+    const control=selected.closest<HTMLElement>('.custom-select');
+    const menu=control?.querySelector<HTMLElement>('.custom-select-menu');
+    const trigger=control?.querySelector<HTMLButtonElement>('.custom-select-trigger');
+    const label=selected.querySelector<HTMLElement>('span')?.textContent??'';
+    const preview=trigger?.querySelector<HTMLElement>('span');
+    if(preview)preview.textContent=label;
+    if(menu)menu.hidden=true;
+    trigger?.setAttribute('aria-expanded','false');
+    const state=control?.closest<HTMLElement>('.permission-control')?.querySelector<HTMLElement>('.permission-state');
+    if(state){
+      state.textContent=({ask:'每次询问',allow:'直接允许',deny:'禁止使用'} as const)[value];
+      state.classList.remove('state-ask','state-allow','state-deny');
+      state.classList.add(`state-${value}`);
+    }
+  }
+
   private value(el:HTMLInputElement):unknown{if(el.type==='number'||el.type==='range')return Number(el.value);return el.value}
   private async updateNested(section:'appearance'|'sensing'|'reminders'|'ai',key:string,value:unknown):Promise<void>{(this.settings[section] as unknown as Record<string,unknown>)[key]=value;await this.save()}
   private async resumeSensing():Promise<void>{
@@ -550,6 +618,13 @@ class ConsoleApp {
     this.runtime=await window.petAPI.pet.getRuntime();
     this.activity=this.runtime.activity;
     if(tab==='stats'||tab==='home'||tab==='ai')this.stats=await window.petAPI.statistics.get(tab==='stats'?this.statsRange:31);
+    if(tab==='privacy'||tab==='storage')this.activityRules=await window.petAPI.activityRules.list();
+    this.render();
+  }
+
+  private showOnboardingStep(step:number, tab:"home"|"privacy"|"ai"):void{
+    this.onboardingStep=step;
+    this.active=tab;
     this.render();
   }
 
@@ -558,12 +633,12 @@ class ConsoleApp {
     if(renderPage)this.render(true);
   }
 
-  private sensingActive():boolean{return this.settings.firstRunConsent&&this.settings.sensing.enabled&&(!this.runtime.sensingPausedUntil||this.runtime.sensingPausedUntil<=Date.now())}
+  private sensingActive():boolean{return this.settings.firstRunConsent&&this.settings.sensing.enabled&&this.settings.manualMode!=='energy_saving'&&(!this.runtime.sensingPausedUntil||this.runtime.sensingPausedUntil<=Date.now())}
   private sensingPaused():boolean{return Boolean(this.settings.firstRunConsent&&this.settings.sensing.enabled&&this.runtime.sensingPausedUntil&&this.runtime.sensingPausedUntil>Date.now())}
-  private sensingLabel():string{if(!this.settings.firstRunConsent)return '等待首次确认';if(!this.settings.sensing.enabled)return '已关闭';if(this.runtime.sensingPausedUntil&&this.runtime.sensingPausedUntil>Date.now())return `暂停至 ${new Date(this.runtime.sensingPausedUntil).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}`;return '感知已开启'}
+  private sensingLabel():string{if(!this.settings.firstRunConsent)return '等待首次确认';if(!this.settings.sensing.enabled)return '已关闭';if(this.settings.manualMode==='energy_saving')return '节能模式已暂停';if(this.runtime.sensingPausedUntil&&this.runtime.sensingPausedUntil>Date.now())return `暂停至 ${new Date(this.runtime.sensingPausedUntil).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}`;return '感知已开启'}
   private sensingControlLabel():string{return !this.settings.sensing.enabled?buttonLabel('play','开启感知'):this.sensingPaused()?buttonLabel('play','恢复感知'):buttonLabel('pause','暂停感知 10 分钟')}
-  private sensorSourceName():string{return this.activity.sensorSource==='native'?'Rust 原生传感器':this.activity.sensorSource==='compat'?'Win32 兼容传感器':'Electron 基础降级'}
-  private foregroundLabel():string{return this.activity.foregroundProcess==='unknown'?'等待前台应用数据':`${this.activity.foregroundProcess} · ${this.categoryName(this.activity.appCategory)}`}
+  private sensorSourceName():string{if(this.settings.manualMode==='energy_saving')return '节能模式（感知已暂停）';return this.activity.sensorSource==='native'?'Rust 原生传感器':this.activity.sensorSource==='compat'?'Win32 兼容传感器':'Electron 基础降级'}
+  private foregroundLabel():string{return this.activity.foregroundProcess==='unknown'?'等待前台应用数据':`${this.activity.applicationLabel} · ${this.activity.activityLabel}`}
   private typingLabel():string{return this.activity.keyboardPulse?`正在输入（10 秒 ${this.activity.keyboardCount10s} 次）`:'当前没有输入脉冲'}
   private percent(value:number):string{return `${Math.max(0,value||0).toFixed(1)}%`}
   private updateResourceIndicators(performance:ActivitySnapshot['performance']):void{
@@ -580,7 +655,7 @@ class ConsoleApp {
       dot.setAttribute('title',value>=80?'占用较高':value>=55?'占用适中':'占用正常');
     });
   }
-  private categoryName(value:string):string{return ({design:'设计',office:'办公',development:'开发',communication:'沟通',entertainment:'娱乐',other:'其他'} as Record<string,string>)[value]??value}
+  private categoryName(value:string):string{return activityLabels[value as ActivityKind]??value}
   private rangeOutput(key:string,value:number):string{return key==='scale'||key==='bubbleScale'?`${Math.round(value*100)}%`:key==='bubbleOpacity'?`${Math.round(value*100)}%`:key==='bubbleDurationSeconds'?`${value} 秒`:String(value)}
 
   private syncAppearanceScale(scale=this.settings.appearance.scale,bubbleScale=this.settings.appearance.bubbleScale):void{
@@ -668,7 +743,7 @@ class ConsoleApp {
     this.toastTimer=window.setTimeout(()=>toast.classList.remove('visible'),2200);
   }
 
-  private async withBusy(button:HTMLButtonElement,task:()=>Promise<void>):Promise<void>{
+  private async withBusy(button:HTMLButtonElement|HTMLSelectElement,task:()=>Promise<void>):Promise<void>{
     if(button.disabled)return;
     button.disabled=true;
     button.classList.add('is-loading');
@@ -712,18 +787,20 @@ class ConsoleApp {
       if(command==='test-ai'){const target=this.root.querySelector<HTMLElement>('.connection-result')!;target.textContent='正在测试连接…';target.classList.add('visible');target.textContent=await window.petAPI.settings.testDeepSeek()}
       if(command==='clear-chats'){if(!await this.confirmAction('清空聊天历史？','全部本地聊天记录将被永久删除，此操作无法撤销。','确认清空'))return;await window.petAPI.storage.clearChats();this.notify('聊天历史已清空')}
       if(command==='clear-stats'){if(!await this.confirmAction('清空统计数据？','全部本地聚合统计将被永久删除，此操作无法撤销。','确认清空'))return;await window.petAPI.statistics.clear();await this.refreshStatistics(true);this.notify('统计数据已清空')}
+      if(command==='clear-activity-rules'){if(!await this.confirmAction('清除全部学习规则？','只删除本机学习库、临时缓存和未完成识别；统计、聊天、设置与 API Key 会保留。','确认清除'))return;await window.petAPI.activityRules.clear();this.activityRules=[];this.render(true);this.notify('本机学习规则已清除')}
       if(command==='refresh-stats'){await this.refreshStatistics(true);this.notify('统计已刷新')}
       if(command==='check-update'){this.updateStatus=await window.petAPI.updates.check();this.syncUpdatePanel();this.notify(this.updateStatus.message,this.updateStatus.phase==='error')}
       if(command==='download-update'){this.updateStatus=await window.petAPI.updates.download();this.syncUpdatePanel();this.notify(this.updateStatus.message,this.updateStatus.phase==='error')}
       if(command==='install-update'){if(!await this.confirmAction('立即安装更新？','桌宠会安全退出并重新启动，设置、聊天和统计数据都会保留。','重启并安装'))return;const started=await window.petAPI.updates.install();if(!started)this.notify('更新尚未下载完成',true)}
       if(command==='open-release-page'){await window.petAPI.updates.openReleases();this.notify('已打开官方发布页')}
-      if(command==='show-onboarding'){this.onboardingOpen=true;this.onboardingStep=0;this.render(true)}
-      if(command==='onboarding-private'){this.settings.firstRunConsent=true;this.settings.sensing.enabled=false;await this.save();this.onboardingStep=2;this.runtime=await window.petAPI.pet.getRuntime();this.render();this.notify('本地感知保持关闭，可稍后开启')}
-      if(command==='onboarding-enable'){this.settings.firstRunConsent=true;this.settings.sensing.enabled=true;await this.save();await this.resumeSensing();this.onboardingStep=2;this.runtime=await window.petAPI.pet.getRuntime();this.render();this.notify('本地感知已按说明开启')}
-      if(command==='onboarding-ai-later'){this.onboardingStep=3;this.render()}
-      if(command==='onboarding-open-ai'){this.onboardingOpen=false;this.onboardingStep=0;await this.openTab('ai');this.notify('请粘贴 DeepSeek API Key 并安全保存')}
-      if(command==='finish-onboarding'){this.onboardingOpen=false;this.onboardingStep=0;this.render();this.notify(`欢迎使用${this.petNameText()}桌宠`)}
+      if(command==='show-onboarding'){this.onboardingOpen=true;this.onboardingFinishTab='home';this.showOnboardingStep(0,'home')}
+      if(command==='onboarding-private'){this.settings.firstRunConsent=true;this.settings.sensing.enabled=false;await this.save();this.runtime=await window.petAPI.pet.getRuntime();this.showOnboardingStep(2,'ai');this.notify('本地感知保持关闭，可稍后开启')}
+      if(command==='onboarding-enable'){this.settings.firstRunConsent=true;this.settings.sensing.enabled=true;await this.save();await this.resumeSensing();this.runtime=await window.petAPI.pet.getRuntime();this.showOnboardingStep(2,'ai');this.notify('本地感知已按说明开启')}
+      if(command==='onboarding-ai-later'){this.onboardingFinishTab='home';this.showOnboardingStep(3,'home')}
+      if(command==='onboarding-open-ai'){this.onboardingFinishTab='ai';this.showOnboardingStep(3,'ai')}
+      if(command==='finish-onboarding'){const finishingApi=this.onboardingFinishTab==='ai';this.onboardingOpen=false;this.onboardingStep=0;this.onboardingFinishTab='home';this.render();this.notify(finishingApi?'请粘贴 DeepSeek API Key 并安全保存':`欢迎使用${this.petNameText()}桌宠`)}
       if(command==='reset-all'){if(!await this.confirmAction('恢复全部默认设置？',`所有偏好、统计与聊天记录都会被清空，${this.petNameText()}将恢复初始状态。`,'恢复默认设置'))return;await window.petAPI.storage.resetAll();location.reload()}
+      if(command==='clear-all'){if(!await this.confirmAction('清除全部本地数据并重启？','统计、聊天、学习规则、设置、加密 API Key、缓存和授权都会删除；仅会递归清理由应用安全标记的目录。','清除并重启'))return;await window.petAPI.storage.clearAll()}
       if(command==='consent'){this.settings.firstRunConsent=true;this.settings.sensing.enabled=true;await this.save();await this.resumeSensing();this.onboardingOpen=false;this.runtime=await window.petAPI.pet.getRuntime();this.render(true);this.notify('本地感知已启用')}
       if(command==='context-preview'){const preview=this.root.querySelector('.context-preview')!;preview.textContent='正在读取并脱敏当前上下文…';const context=await window.petAPI.chat.contextPreview();preview.textContent=JSON.stringify(context,null,2)}
       if(command==='chat'){await window.petAPI.pet.openChat();this.notify('智能体聊天已打开')}

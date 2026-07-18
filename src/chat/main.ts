@@ -18,6 +18,25 @@ const icon = (name: IconName): string => {
 };
 
 interface StreamingMessage { sessionId: string; requestId: string; text: string; source: "api" | "local"; userId: string; error?: string; }
+interface Suggestion { title: string; detail: string; prompt: string; icon: "context" | "message" | "search"; }
+
+const offlineSuggestionSets: Suggestion[][] = [
+  [
+    { title: "梳理当前任务", detail: "找出最重要的下一步", prompt: "帮我梳理一下当前任务，给出最重要的下一步", icon: "context" },
+    { title: "制定专注计划", detail: "拆成容易开始的小步骤", prompt: "帮我制定一个专注 25 分钟的计划", icon: "message" },
+    { title: "陪我分析问题", detail: "从困惑中找到突破口", prompt: "我有点卡住了，陪我分析一下", icon: "search" }
+  ],
+  [
+    { title: "快速列个清单", detail: "把脑中的事项落到纸面", prompt: "帮我把接下来要做的事整理成清单", icon: "context" },
+    { title: "开始一个小任务", detail: "用五分钟跨过启动门槛", prompt: "帮我选一个五分钟就能开始的小任务", icon: "message" },
+    { title: "复盘刚才的进展", detail: "确认已完成与待处理事项", prompt: "陪我复盘一下刚才的进展", icon: "search" }
+  ],
+  [
+    { title: "安排今天的节奏", detail: "留出专注与休息时间", prompt: "帮我安排一下今天剩余时间的节奏", icon: "context" },
+    { title: "写一段回复", detail: "把想法表达得更清楚", prompt: "帮我起草一段简洁、礼貌的回复", icon: "message" },
+    { title: "换个思路", detail: "为卡住的问题找新角度", prompt: "我遇到一个难题，帮我从不同角度分析", icon: "search" }
+  ]
+];
 
 class ChatApp {
   private settings!: Settings;
@@ -34,6 +53,9 @@ class ChatApp {
   private creatingTopic = false;
   private drafts = new Map<string, string>();
   private contextReturnFocus: HTMLElement | null = null;
+  private suggestions = offlineSuggestionSets[0]!;
+  private suggestionSet = 0;
+  private refreshingSuggestions = false;
   private root = document.querySelector<HTMLElement>("#chat-app")!;
 
   async mount(): Promise<void> {
@@ -42,7 +64,7 @@ class ChatApp {
       [this.settings, this.status, this.sessions] = await Promise.all([
         window.petAPI.settings.get(), window.petAPI.chat.status(), window.petAPI.chat.list()
       ]);
-      if (!this.sessions.length) this.sessions = [this.summary(await window.petAPI.chat.create())];
+      await window.petAPI.agentApproval.clear();
       this.activeId = this.sessions[0]?.id ?? "";
       this.renderShell();
       this.bind();
@@ -50,6 +72,7 @@ class ChatApp {
       this.renderStatus();
       this.updateComposerState();
       await this.loadActiveMessages();
+      if (!this.messages.length && this.status.apiConfigured && this.status.online && this.status.remaining > 0) void this.refreshSuggestions();
       window.petAPI.chat.onChunk((chunk) => this.handleChunk(chunk));
       window.petAPI.settings.onChanged((settings) => {
         this.settings = settings;
@@ -75,9 +98,9 @@ class ChatApp {
   private renderShell(): void {
     this.root.innerHTML = `<div class="chat-shell theme-${this.settings.appearance.theme}" style="--accent:${safeAccent(this.settings.appearance.accentColor)}">
       <aside class="topic-sidebar" id="topic-sidebar" aria-label="对话导航"><div class="chat-brand"><span class="brand-avatar" data-chat-initial>${escapeHtml(Array.from(this.chatName())[0] ?? "珊")}</span><div><b><span data-chat-name>${escapeHtml(this.chatName())}</span> 智能体</b><small><i></i>本地私密 · 随时陪伴</small></div></div><button class="new-topic primary-action" type="button">${icon("plus")}<span>新建对话</span></button><div class="topic-search">${icon("search")}<input type="search" placeholder="搜索历史对话" aria-label="搜索历史对话"><button type="button" data-clear-search aria-label="清除搜索" title="清除搜索" hidden>${icon("close")}</button></div><div class="topic-caption"><span>对话记录</span><small data-topic-count></small></div><nav class="topic-list" aria-label="聊天话题"></nav><div class="sidebar-footer"><button type="button" data-open-console="ai" title="打开智能体与隐私设置">${icon("settings")}<span>智能体与隐私设置</span></button><div class="privacy-note">${icon("context")}<span><b>仅保存在这台电脑</b><small>上下文不会写入聊天记录</small></span></div></div></aside><button class="sidebar-scrim" type="button" aria-label="收起对话导航" hidden></button>
-      <main class="conversation"><header class="conversation-header"><button class="mobile-menu" type="button" aria-label="展开对话导航" aria-controls="topic-sidebar" aria-expanded="false">${icon("menu")}</button><div class="conversation-title"><span class="title-avatar" data-chat-initial>${escapeHtml(Array.from(this.chatName())[0] ?? "珊")}</span><div><div class="title-line"><h1 data-chat-title>新对话</h1><span class="conversation-presence" data-chat-presence><i></i>在线</span></div><p data-model-label></p></div></div><div class="header-actions"><button class="status-chip" type="button" data-show-context aria-expanded="false" title="查看本次上下文"></button><button class="header-icon" type="button" data-open-console="ai" aria-label="打开聊天设置" title="聊天设置">${icon("settings")}</button><button class="header-icon window-close" type="button" aria-label="关闭聊天" title="关闭聊天">${icon("close")}</button></div></header><section class="message-viewport"><div class="messages" role="log" aria-live="polite" aria-relevant="additions text"></div></section><button class="jump-latest" type="button" data-jump-latest hidden>${icon("send")}<span>回到最新消息</span></button><footer class="composer-area"><div class="local-mode-banner" hidden></div><form class="composer"><textarea data-chat-composer rows="1" maxlength="8000" placeholder="给${escapeHtml(this.chatName())}发消息…" aria-label="给${escapeHtml(this.chatName())}发送消息" aria-describedby="composer-help"></textarea><button class="send-button" type="submit" aria-label="发送消息" title="发送消息" disabled>${icon("send")}</button><button class="stop-button" type="button" aria-label="停止生成" title="停止生成" hidden>${icon("stop")}</button></form><div class="composer-meta"><span class="composer-state"><span data-context-meta></span><span data-quota-meta></span></span><span class="composer-guidance"><span data-character-count>0 / 8000</span><span id="composer-help" data-compose-status role="status">Enter 发送 · Shift+Enter 换行</span></span></div><p class="ai-notice">AI 生成内容仅供参考，请核对重要信息</p></footer></main>
+      <main class="conversation"><header class="conversation-header"><button class="mobile-menu" type="button" aria-label="展开对话导航" aria-controls="topic-sidebar" aria-expanded="false">${icon("menu")}</button><div class="conversation-title"><span class="title-avatar" data-chat-initial>${escapeHtml(Array.from(this.chatName())[0] ?? "珊")}</span><div><div class="title-line"><h1 data-chat-title>新对话</h1><span class="conversation-presence" data-chat-presence><i></i>在线</span></div><p data-model-label></p></div></div><div class="header-actions"><button class="status-chip" type="button" data-show-context aria-expanded="false" title="查看本次上下文"></button><button class="header-icon" type="button" data-open-console="ai" aria-label="打开聊天设置" title="聊天设置">${icon("settings")}</button><button class="header-icon window-close" type="button" aria-label="关闭聊天" title="关闭聊天">${icon("close")}</button></div></header><section class="message-viewport"><div class="messages" role="log" aria-live="polite" aria-relevant="additions text"></div></section><button class="jump-latest" type="button" data-jump-latest hidden>${icon("send")}<span>回到最新消息</span></button><footer class="composer-area"><div class="local-mode-banner" hidden></div><form class="composer"><textarea data-chat-composer rows="1" maxlength="8000" placeholder="给${escapeHtml(this.chatName())}发消息…" aria-label="给${escapeHtml(this.chatName())}发送消息" aria-describedby="composer-help"></textarea><button class="send-button" type="submit" aria-label="发送消息" title="发送消息" disabled>${icon("send")}</button><button class="stop-button" type="button" aria-label="停止生成" title="停止生成" hidden>${icon("stop")}</button></form><div class="composer-meta"><span class="composer-state"><button class="thinking-toggle" type="button" data-deep-thinking aria-pressed="false" title="切换深度思考"><span>深度思考</span><i></i></button><span data-context-meta></span></span><span class="composer-guidance"><span id="composer-help" data-compose-status role="status">AI 生成内容仅供参考，请核对重要信息</span><span data-character-count>0 / 8000</span></span></div></footer></main>
       <dialog class="context-drawer" aria-labelledby="context-drawer-title"><header><div><b id="context-drawer-title">本次上下文</b><small>发送前临时读取并脱敏，不写入聊天记录</small></div><button type="button" data-close-context aria-label="关闭上下文面板" title="关闭">${icon("close")}</button></header><div class="context-content"></div><button type="button" class="drawer-settings" data-open-console="privacy">${icon("settings")}在控制台修改感知范围</button></dialog>
-      <dialog class="approval-dialog"><form method="dialog"><span class="approval-icon">${icon("context")}</span><h2>允许智能体执行工具？</h2><p data-approval-copy></p><pre data-approval-detail></pre><div><button value="deny">暂不允许</button><button value="allow" class="approve">允许本次</button></div></form></dialog>
+      <dialog class="approval-dialog"><form method="dialog"><header class="approval-header"><span class="approval-icon">${icon("context")}</span><div><span class="approval-mode">当前授权方式 · 每次询问</span><h2>允许智能体执行工具？</h2></div></header><p class="approval-copy" data-approval-copy></p><div class="approval-guidance"><p><b>仅允许本次对话</b><span>仅在当前这段对话内有效；刷新聊天台或切换到其他历史对话后，需要再次授权。</span></p><p><b>以后直接允许</b><span>会将此工具改为“直接允许”，以后所有对话都不再询问；可随时在控制台改回。</span></p></div><pre data-approval-detail></pre><div class="approval-actions"><button value="deny">取消本次执行</button><button value="allow_conversation" class="approve-once">仅允许本次对话</button><button value="allow_always" class="approve">以后直接允许</button></div></form></dialog>
       <dialog class="rename-dialog"><form method="dialog"><h2>重命名对话</h2><p>使用一个容易识别的名称，之后可以从对话记录继续聊。</p><label>对话名称<input maxlength="48" autocomplete="off"></label><div><button value="cancel">取消</button><button value="save" class="save">保存</button></div></form></dialog>
       <dialog class="delete-dialog"><form method="dialog"><span class="danger-icon">${icon("trash")}</span><h2>删除这段对话？</h2><p>“<span data-delete-name></span>”及其中的全部消息将从本地永久删除。</p><div><button value="cancel">取消</button><button value="delete" class="delete-confirm">删除对话</button></div></form></dialog>
       <div class="toast" data-toast role="status" aria-live="polite" hidden></div>
@@ -114,6 +137,7 @@ class ChatApp {
     textarea.addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); void this.send(); } });
     textarea.addEventListener("input", () => { this.resizeComposer(); this.saveDraft(); this.updateComposerState(); });
     this.root.querySelector(".stop-button")?.addEventListener("click", () => void this.stop());
+    this.root.querySelector<HTMLButtonElement>("[data-deep-thinking]")?.addEventListener("click", () => void this.toggleDeepThinking());
     this.root.querySelectorAll<HTMLElement>("[data-open-console]").forEach((button) => button.addEventListener("click", () => void window.petAPI.console.open((button.dataset.openConsole ?? "ai") as "ai" | "privacy")));
     this.root.querySelector(".window-close")?.addEventListener("click", () => void window.petAPI.chat.close());
     this.root.querySelector("[data-show-context]")?.addEventListener("click", (event) => { this.contextReturnFocus = event.currentTarget as HTMLElement; void this.showContext(); });
@@ -136,13 +160,14 @@ class ChatApp {
         this.updateComposerState();
         textarea.focus();
       }
+      if (target.closest("[data-refresh-suggestions]")) void this.refreshSuggestions();
     });
     this.root.addEventListener("keydown", (event) => this.handleKeyboard(event));
   }
 
   private async loadActiveMessages(): Promise<void> {
     const id = this.activeId;
-    if (!id) return;
+    if (!id) { this.renderMessages(true); return; }
     const page = await window.petAPI.chat.messages(id, 0, 50);
     if (id !== this.activeId) return;
     this.messages = page.messages;
@@ -190,10 +215,11 @@ class ChatApp {
   private renderMessages(scrollToEnd = false): void {
     const container = this.root.querySelector<HTMLElement>(".messages");
     const session = this.activeSession();
-    if (!container || !session) return;
-    this.root.querySelector<HTMLElement>("[data-chat-title]")!.textContent = session.title;
+    if (!container) return;
+    this.root.querySelector<HTMLElement>("[data-chat-title]")!.textContent = session?.title ?? "新对话";
     if (!this.messages.length) {
-      container.innerHTML = `<div class="empty-chat"><div class="empty-orb"><span data-chat-initial>${escapeHtml(Array.from(this.chatName())[0] ?? "珊")}</span></div><p class="empty-kicker"><span data-chat-name>${escapeHtml(this.chatName())}</span> 已准备好</p><h2>今天想一起完成什么？</h2><p>可以从当前桌面任务开始，也可以新建一个完全独立的话题。</p><div class="suggestions"><button type="button" data-suggestion="帮我梳理一下当前任务，给出最重要的下一步"><span>${icon("context")}</span><b>梳理当前任务</b><small>结合已授权的桌面上下文</small></button><button type="button" data-suggestion="帮我制定一个专注 25 分钟的计划"><span>${icon("message")}</span><b>制定专注计划</b><small>拆成容易开始的小步骤</small></button><button type="button" data-suggestion="我有点卡住了，陪我分析一下"><span>${icon("search")}</span><b>陪我分析问题</b><small>从困惑中找到突破口</small></button></div><p class="empty-privacy">${icon("context")}上下文仅在发送时临时读取，且始终受隐私规则保护</p></div>`;
+      const cards = this.suggestions.map((item) => `<button type="button" data-suggestion="${escapeHtml(item.prompt)}"><span>${icon(item.icon)}</span><b>${escapeHtml(item.title)}</b><small>${escapeHtml(item.detail)}</small></button>`).join("");
+      container.innerHTML = `<div class="empty-chat"><div class="empty-orb"><span data-chat-initial>${escapeHtml(Array.from(this.chatName())[0] ?? "珊")}</span></div><p class="empty-kicker"><span data-chat-name>${escapeHtml(this.chatName())}</span> 已准备好</p><h2>今天想一起完成什么？</h2><p>可以从当前桌面任务开始，也可以新建一个完全独立的话题。</p><div class="suggestion-heading"><span>试试这些</span><button type="button" data-refresh-suggestions ${this.refreshingSuggestions ? "disabled" : ""}>${this.refreshingSuggestions ? "正在刷新…" : "换一批"}</button></div><div class="suggestions">${cards}</div><p class="empty-privacy">${icon("context")}上下文仅在发送时临时读取，且始终受隐私规则保护</p></div>`;
     } else {
       const loader = this.nextCursor === null ? "" : `<button class="history-loader" type="button" data-load-older>加载更早消息</button>`;
       container.innerHTML = `${loader}${this.messages.map((message) => this.messageHtml(message)).join("")}`;
@@ -216,8 +242,14 @@ class ChatApp {
     const context = this.root.querySelector<HTMLElement>("[data-context-meta]");
     const quota = this.root.querySelector<HTMLElement>("[data-quota-meta]");
     const banner = this.root.querySelector<HTMLElement>(".local-mode-banner");
+    const thinking = this.root.querySelector<HTMLButtonElement>("[data-deep-thinking]");
     const online = this.status.apiConfigured && this.status.online && this.status.remaining > 0;
     if (label) label.textContent = `${online ? "智能对话" : "本地模式"} · ${this.status.model}`;
+    if (thinking) {
+      thinking.classList.toggle("is-on", this.settings.ai.deepThinking);
+      thinking.setAttribute("aria-pressed", String(this.settings.ai.deepThinking));
+      thinking.title = this.settings.ai.deepThinking ? "深度思考已开启，点击关闭" : "深度思考已关闭，点击开启";
+    }
     if (chip) {
       chip.innerHTML = `${icon("context")}<span>${this.status.contextEnabled ? this.status.contextBlocked ? "上下文受保护" : "上下文已关联" : "上下文已关闭"}</span>`;
       chip.classList.toggle("is-protected", this.status.contextBlocked);
@@ -231,6 +263,23 @@ class ChatApp {
     }
   }
 
+  private async toggleDeepThinking(): Promise<void> {
+    const button = this.root.querySelector<HTMLButtonElement>("[data-deep-thinking]");
+    if (!button || button.disabled) return;
+    const previous = this.settings.ai.deepThinking;
+    this.settings.ai.deepThinking = !previous;
+    button.disabled = true;
+    this.renderStatus();
+    try {
+      this.settings = await window.petAPI.settings.update(this.settings);
+      this.showToast(`深度思考已${this.settings.ai.deepThinking ? "开启" : "关闭"}`, "success");
+    } catch {
+      this.settings.ai.deepThinking = previous;
+      this.renderStatus();
+      this.showToast("深度思考设置保存失败，请重试", "error");
+    } finally { button.disabled = false; }
+  }
+
   private async createTopic(): Promise<void> {
     if (this.creatingTopic) return;
     this.creatingTopic = true;
@@ -238,18 +287,17 @@ class ChatApp {
     if (button) { button.disabled = true; button.setAttribute("aria-busy", "true"); }
     this.saveDraft();
     try {
-      const session = await window.petAPI.chat.create();
-      this.sessions.unshift(this.summary(session));
-      this.activeId = session.id;
+      await window.petAPI.agentApproval.clear();
+      this.activeId = "";
       this.messages = [];
       this.nextCursor = null;
       this.renderTopics();
       this.renderMessages(true);
-      this.restoreDraft();
+      this.textarea().value = "";
       this.toggleSidebar(false);
       this.textarea().focus();
     } catch {
-      this.showToast("新对话创建失败，请重试", "error");
+      this.showToast("暂时无法切换到新对话，请重试", "error");
     } finally {
       this.creatingTopic = false;
       if (button) { button.disabled = false; button.removeAttribute("aria-busy"); }
@@ -259,6 +307,7 @@ class ChatApp {
   private async selectTopic(id: string): Promise<void> {
     if (id === this.activeId) { this.toggleSidebar(false); return; }
     if (this.streaming) { this.showToast("请先停止当前回复，再切换对话"); return; }
+    await window.petAPI.agentApproval.clear();
     this.saveDraft();
     this.activeId = id;
     this.messages = [];
@@ -297,7 +346,7 @@ class ChatApp {
       await window.petAPI.chat.delete(id);
       this.drafts.delete(id);
       await this.refreshSessions();
-      if (!this.sessions.length) await this.createTopic();
+      if (!this.sessions.length) { this.activeId = ""; this.messages = []; this.nextCursor = null; this.renderMessages(true); }
       else if (wasActive) await this.loadActiveMessages();
       this.showToast("对话已删除", "success");
     } catch { this.showToast("删除失败，请重试", "error"); }
@@ -308,7 +357,12 @@ class ChatApp {
     const textarea = this.textarea();
     const text = textarea.value.trim();
     if (!text) { textarea.focus(); return; }
-    if (!this.activeId) await this.createTopic();
+    if (!this.activeId) {
+      const session = await window.petAPI.chat.create();
+      this.sessions.unshift(this.summary(session));
+      this.activeId = session.id;
+      this.renderTopics();
+    }
     if (!this.activeId) return;
     const user: ChatMessage = { id: crypto.randomUUID(), role: "user", content: text, createdAt: Date.now() };
     this.messages.push(user);
@@ -395,6 +449,27 @@ class ChatApp {
     if (heading) heading.textContent = this.activeSession()?.title ?? "新对话";
   }
 
+  private async refreshSuggestions(): Promise<void> {
+    if (this.refreshingSuggestions) return;
+    this.refreshingSuggestions = true;
+    this.renderMessages();
+    try {
+      const online = this.status.apiConfigured && this.status.online && this.status.remaining > 0;
+      if (online) {
+        const suggestions = await window.petAPI.chat.suggestions();
+        if (Array.isArray(suggestions) && suggestions.length === 3) this.suggestions = suggestions;
+        else this.suggestionSet = (this.suggestionSet + 1) % offlineSuggestionSets.length;
+      } else this.suggestionSet = (this.suggestionSet + 1) % offlineSuggestionSets.length;
+      if (!online) this.suggestions = offlineSuggestionSets[this.suggestionSet]!;
+    } catch {
+      this.suggestionSet = (this.suggestionSet + 1) % offlineSuggestionSets.length;
+      this.suggestions = offlineSuggestionSets[this.suggestionSet]!;
+    } finally {
+      this.refreshingSuggestions = false;
+      if (!this.messages.length) this.renderMessages();
+    }
+  }
+
   private async refreshStatus(): Promise<void> { this.status = await window.petAPI.chat.status(); this.renderStatus(); }
 
   private async showContext(): Promise<void> {
@@ -419,9 +494,28 @@ class ChatApp {
 
   private requestApproval(call: AgentToolCall): void {
     const dialog = this.root.querySelector<HTMLDialogElement>(".approval-dialog")!;
-    dialog.querySelector<HTMLElement>("[data-approval-copy]")!.textContent = `“${this.status.petName}”请求执行 ${call.name}`;
+    const labels: Partial<Record<AgentToolCall["name"], string>> = { open_url: "打开网页", launch_app: "启动应用", read_current_context: "读取当前上下文" };
+    dialog.querySelector<HTMLElement>("[data-approval-copy]")!.textContent = `“${this.status.petName}”请求执行「${labels[call.name] ?? call.name}」`;
     dialog.querySelector<HTMLElement>("[data-approval-detail]")!.textContent = JSON.stringify(call.arguments, null, 2);
-    dialog.addEventListener("close", () => void window.petAPI.agentApproval.resolve(call.id, dialog.returnValue === "allow"), { once: true });
+    // dialog.returnValue 会保留上一次关闭时的值；每次显式复位，避免按 Esc
+    // 或窗口关闭时误沿用上一轮“允许”的结果。
+    dialog.returnValue = "deny";
+    dialog.addEventListener("close", () => void (async () => {
+      const quickAllow = dialog.returnValue === "allow_always";
+      const allowConversation = dialog.returnValue === "allow_conversation";
+      const approved = allowConversation || quickAllow;
+      if (quickAllow && (call.name === "open_url" || call.name === "launch_app" || call.name === "read_current_context")) {
+        try {
+          const next = structuredClone(this.settings);
+          next.ai.toolPermissions[call.name] = "allow";
+          this.settings = await window.petAPI.settings.update(next);
+          this.showToast(`已将“${labels[call.name] ?? call.name}”改为直接允许`, "success");
+        } catch {
+          this.showToast("本次已允许，但快速授权未能保存", "error");
+        }
+      }
+      await window.petAPI.agentApproval.resolve(call.id, approved, allowConversation, this.activeId);
+    })(), { once: true });
     dialog.showModal();
   }
 
@@ -513,7 +607,7 @@ class ChatApp {
     this.textarea().disabled = value;
     this.root.querySelector<HTMLElement>(".composer")?.setAttribute("aria-busy", String(value));
     const status = this.root.querySelector<HTMLElement>("[data-compose-status]");
-    if (status) status.textContent = value ? "正在生成，可随时停止" : "Enter 发送 · Shift+Enter 换行";
+    if (status) status.textContent = value ? "正在生成，可随时停止" : "AI 生成内容仅供参考，请核对重要信息";
     const presence = this.root.querySelector<HTMLElement>("[data-chat-presence]");
     if (presence) { presence.classList.toggle("is-working", value); presence.innerHTML = `<i></i>${value ? "思考中" : "在线"}`; }
     this.updateComposerState();

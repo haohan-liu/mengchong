@@ -94,7 +94,7 @@ npm run smoke
 
 ## 动画资产
 
-动作源清单是根目录 `animations_manifest.json`，构建使用的镜像是 `src/data/animations.json`。正式序列位于：
+动作使用根目录 `animations_manifest.json` 作为唯一清单；schema v2 可为动作声明 `enter`、`sustain`、`exit` 与 `interruptPolicy`。正式序列位于：
 
 ```text
 public/sprites/{action_id}/{action_id}_{frameIndex:03d}.png

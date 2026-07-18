@@ -1,6 +1,6 @@
 {
   "name": "ai-desktop-pet",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "轻量、隐私可控的 Windows AI 桌宠",
   "author": {
@@ -66,13 +66,21 @@
     "win": {
       "target": "nsis",
       "icon": "assets/icons/app-icon.ico",
-      "signExecutable": false
+      "signExts": [
+        "pet-sensor.exe"
+      ]
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "deleteAppDataOnUninstall": true,
-      "include": "build/installer.nsh"
+      "include": "build/installer.nsh",
+      "language": "2052",
+      "installerHeader": "build/installerHeader.bmp",
+      "installerSidebar": "build/installerSidebar.bmp",
+      "uninstallerSidebar": "build/uninstallerSidebar.bmp",
+      "installerIcon": "assets/icons/app-icon.ico",
+      "uninstallerIcon": "assets/icons/app-icon.ico"
     },
     "publish": [
       {

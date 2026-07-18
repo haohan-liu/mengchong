@@ -1,27 +1,42 @@
 import type { AnimationDefinition } from "../../types";
 
-interface CachedAction { frames: ImageBitmap[]; uniqueFrames: ImageBitmap[]; usedAt: number; }
+interface CachedAction { frames: ImageBitmap[]; usedAt: number; }
 
 export class AssetLoader {
   private cache = new Map<string, CachedAction>();
   private loading = new Map<string, Promise<ImageBitmap[]>>();
-  // Keep the current action plus a small idle set only. A decoded 512px
-  // ImageBitmap is much larger than its PNG file, so retaining old actions
-  // quickly becomes the dominant renderer-memory cost.
-  private readonly maxFrames = 32;
+  private generation = 0;
+  // Retain the active action and, at most, one short interaction action. A
+  // 384px RGBA ImageBitmap uses about 0.56 MB after decoding, so 18 frames
+  // keep steady-state texture memory close to 10 MB instead of growing with
+  // every action the user has seen.
+  private readonly maxFrames = 18;
 
   async load(definition: AnimationDefinition): Promise<ImageBitmap[]> {
     const cached = this.cache.get(definition.id);
     if (cached) { cached.usedAt = performance.now(); return cached.frames; }
     const pending = this.loading.get(definition.id);
     if (pending) return pending;
-    const promise = this.loadFrames(definition);
+    const generation = this.generation;
+    let promise!: Promise<ImageBitmap[]>;
+    promise = this.loadFrames(definition).then((frames) => {
+      // A window can be hidden while images are decoding. Do not let that
+      // stale decode repopulate a cache that was explicitly released.
+      if (generation !== this.generation) {
+        frames.forEach((frame) => frame.close());
+        return [];
+      }
+      this.cache.set(definition.id, { frames, usedAt: performance.now() });
+      return frames;
+    });
     this.loading.set(definition.id, promise);
     try {
-      const frames = await promise;
-      this.cache.set(definition.id, { frames, uniqueFrames: [...new Set(frames)], usedAt: performance.now() });
-      return frames;
-    } finally { this.loading.delete(definition.id); }
+      return await promise;
+    } finally {
+      // An old, cancelled decode must not delete a newer load for the same
+      // action after the pet becomes visible again.
+      if (this.loading.get(definition.id) === promise) this.loading.delete(definition.id);
+    }
   }
 
   trim(current: string): void { this.evict(current); }
@@ -46,24 +61,26 @@ export class AssetLoader {
       uniqueFrames.forEach((frame) => frame.close());
       throw error;
     }
-    // Preserve the former forward-then-exact-reverse visual sequence without
-    // storing or decoding a second physical copy of every PNG.
-    return [...uniqueFrames, ...[...uniqueFrames].reverse()];
+    return uniqueFrames;
   }
 
   private evict(current: string): void {
-    let total = [...this.cache.values()].reduce((sum, entry) => sum + entry.uniqueFrames.length, 0);
+    let total = [...this.cache.values()].reduce((sum, entry) => sum + entry.frames.length, 0);
     const candidates = [...this.cache.entries()].filter(([id]) => id !== current).sort((a, b) => a[1].usedAt - b[1].usedAt);
     for (const [id, entry] of candidates) {
       if (total <= this.maxFrames) break;
-      entry.uniqueFrames.forEach((frame) => frame.close());
+      entry.frames.forEach((frame) => frame.close());
       this.cache.delete(id);
-      total -= entry.uniqueFrames.length;
+      total -= entry.frames.length;
     }
   }
 
-  dispose(): void {
-    this.cache.forEach((entry) => entry.uniqueFrames.forEach((frame) => frame.close()));
+  clear(): void {
+    this.generation += 1;
+    this.cache.forEach((entry) => entry.frames.forEach((frame) => frame.close()));
     this.cache.clear();
+    this.loading.clear();
   }
+
+  dispose(): void { this.clear(); }
 }

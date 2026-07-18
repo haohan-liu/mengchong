@@ -38,11 +38,14 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
 .bubble-speaker strong { font-size: 11px; font-weight: 800; }
 .bubble-text { min-height: 22px; max-height: 54px; overflow: auto; margin-top: 4px; color: var(--bubble-text,#3c2c39); line-height: 1.62; font-weight: 520; overflow-wrap: anywhere; scrollbar-width: thin; }
 .status-pill { position: absolute; bottom: var(--status-bottom); left: 50%; display: flex; align-items: center; gap: 7px; border: 1px solid color-mix(in srgb,var(--accent) 24%,rgba(232,208,219,.8)); border-radius: 999px; padding: 6px 11px; background: color-mix(in srgb,var(--accent) 6%,rgba(255,250,253,.94)); box-shadow: 0 4px 12px color-mix(in srgb,var(--accent) 10%,transparent); font-size: 12px; white-space: nowrap; translate: -50% 0; scale: var(--status-scale); transform-origin: center bottom; transition: opacity 160ms ease; will-change: transform; }
+.status-pill span { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-pill i { width: 7px; height: 7px; border-radius: 50%; background: #72b88a; box-shadow: none; }
 .pet-context { position: absolute; z-index: 30; right: 15px; bottom: 62px; width: 160px; overflow: hidden; border: 1px solid color-mix(in srgb,var(--accent) 25%,#ead8df); border-radius: 16px; padding: 7px; background: color-mix(in srgb,var(--accent) 5%,rgba(255,250,253,.97)); box-shadow: 0 12px 26px color-mix(in srgb,var(--accent) 15%,transparent); scale: var(--status-scale); transform-origin: bottom right; animation: pet-context-in 150ms ease-out; }
 .pet-context small { display: block; padding: 5px 8px 7px; color: #a47c8b; font-size: 9.5px; font-weight: 700; letter-spacing: .04em; }
 .pet-context button { display: block; width: 100%; min-height: 32px; border: 0; border-radius: 10px; padding: 7px 9px; background: none; color: #513742; font-size: 11.5px; text-align: left; cursor: pointer; }
 .pet-context button:hover { background: color-mix(in srgb,var(--accent) 14%,transparent); color: var(--accent); }
+.pet-context .pet-context-quit { margin-top: 3px; color: #b84b5a; }
+.pet-context .pet-context-quit:hover { background: rgba(184,75,90,.1); color: #a93c4b; }
 .pet-shell.energy-saving .status-pill i { background: #78aa8b; box-shadow: none; }
 [hidden] { display: none !important; }
 

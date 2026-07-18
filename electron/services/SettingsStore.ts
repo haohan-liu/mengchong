@@ -1,9 +1,9 @@
 import { app, safeStorage } from "electron";
-import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { Settings } from "../../src/types.js";
 
-export const SETTINGS_VERSION = 6;
+export const SETTINGS_VERSION = 8;
 
 export function defaultSettings(): Settings {
   return {
@@ -35,6 +35,7 @@ export function defaultSettings(): Settings {
       power: true,
       network: true,
       autoContext: true,
+      smartActivityLearning: false,
       blockedApps: ["1password", "bitwarden", "keepass", "credentialui", "password"],
       allowedApps: []
     },
@@ -61,6 +62,7 @@ export function defaultSettings(): Settings {
       includeContext: true,
       toolPermissions: {
         open_url: "ask",
+        launch_app: "ask",
         read_current_context: "ask"
       }
     },
@@ -137,6 +139,7 @@ export function mergeSettings(input: Partial<Settings>): Settings {
       meeting: boolean(sensing.meeting, base.sensing.meeting), microphone: boolean(sensing.microphone, base.sensing.microphone),
       power: boolean(sensing.power, base.sensing.power), network: boolean(sensing.network, base.sensing.network),
       autoContext: boolean(sensing.autoContext, base.sensing.autoContext),
+      smartActivityLearning: boolean(sensing.smartActivityLearning, base.sensing.smartActivityLearning),
       blockedApps: strings(sensing.blockedApps, base.sensing.blockedApps), allowedApps: strings(sensing.allowedApps, base.sensing.allowedApps)
     },
     reminders: {
@@ -159,6 +162,7 @@ export function mergeSettings(input: Partial<Settings>): Settings {
       includeContext: boolean(ai.includeContext, base.ai.includeContext),
       toolPermissions: {
         open_url: choice(toolPermissions.open_url, ["ask", "allow", "deny"] as const, base.ai.toolPermissions.open_url),
+        launch_app: choice(toolPermissions.launch_app, ["ask", "allow", "deny"] as const, base.ai.toolPermissions.launch_app),
         read_current_context: choice(toolPermissions.read_current_context, ["ask", "allow", "deny"] as const, base.ai.toolPermissions.read_current_context)
       }
     },
@@ -230,5 +234,18 @@ export class SettingsStore {
     try { await access(this.secretPath); this.apiKeyConfigured = Boolean(await this.getApiKey()); }
     catch { this.apiKeyConfigured = false; }
     return this.apiKeyConfigured;
+  }
+
+  async clearApiKey(): Promise<void> {
+    await rm(this.secretPath, { force: true });
+    this.apiKeyConfigured = false;
+  }
+
+  async clearAndReset(): Promise<Settings> {
+    await this.writeChain.catch(() => undefined);
+    await Promise.all([rm(this.settingsPath, { force: true }), this.clearApiKey()]);
+    this.settings = defaultSettings();
+    this.settings.dataDirectory = join(app.getPath("userData"), "data");
+    return this.save(this.settings);
   }
 }

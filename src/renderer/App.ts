@@ -1,8 +1,9 @@
-import animations from "../data/animations.json";
+import animations from "../../animations_manifest.json";
 import { directionalDragAction, isDirectionalDragAction, type ActivitySnapshot, type AnimationDefinition, type DragDirection, type PetSpeechEvent, type PetSpeechKind, type PetState, type Settings } from "../types";
 import { Animator } from "./animation/Animator";
 import { StateMachine } from "./state/StateMachine";
 import { ClickTracker, DragDirectionTracker, dragDirectionForMove, linkedBubbleScale, passedDragThreshold, stepPetScale } from "./interaction";
+import { TypingTracker } from "./activity/TypingTracker";
 
 export class PetApp {
   private animator!: Animator;
@@ -35,6 +36,7 @@ export class PetApp {
   private unlisten: Array<() => void> = [];
   private lastPointer = { x: 0, y: 0, at: 0 };
   private activityMode = "startup";
+  private typingTracker = new TypingTracker();
 
   constructor(private readonly root: HTMLElement) {}
 
@@ -58,7 +60,12 @@ export class PetApp {
     this.animator.setCompleteListener((action) => this.machine.animationCompleted(action));
     this.bind();
     this.machine.transition("APPEAR", "wave_hello", true);
-    window.setTimeout(() => void this.animator.preload(["clicked", "multi_clicked"].map((id) => map.get(id)!).filter(Boolean)), 500);
+    // Keep only the most likely first interaction warm. The multi-click
+    // action is decoded on demand, preventing startup from retaining a second
+    // full animation sequence just in case it is used.
+    window.setTimeout(() => {
+      if (this.settings.manualMode !== "energy_saving") void this.animator.preload([map.get("clicked")!].filter(Boolean));
+    }, 500);
   }
 
   private render(): void {
@@ -73,7 +80,7 @@ export class PetApp {
         </section>
         <button class="pet-hit" aria-label="桌宠"><canvas></canvas></button>
         <div class="status-pill"><i></i><span>在你身边</span></div>
-        <div class="pet-context" hidden><small>快捷菜单</small><button data-action="console">打开控制台</button><button data-action="chat" data-pet-chat-label>和珊珊聊天</button><button data-action="energy" data-energy-label>开启节能模式</button><button data-action="hide">隐藏到托盘</button></div>
+        <div class="pet-context" hidden><small>快捷菜单</small><button data-action="console">打开控制台</button><button data-action="chat" data-pet-chat-label>和珊珊聊天</button><button data-action="energy" data-energy-label>开启节能模式</button><button data-action="hide">隐藏到托盘</button><button data-action="quit" class="pet-context-quit">退出桌宠</button></div>
       </main>`;
   }
 
@@ -155,6 +162,7 @@ export class PetApp {
       if (action === "chat") void window.petAPI.pet.openChat();
       if (action === "energy") void this.toggleEnergySaving();
       if (action === "hide") void window.petAPI.pet.hide();
+      if (action === "quit") void window.petAPI.pet.quit();
     });
     window.addEventListener("blur", () => { const menu = this.root.querySelector<HTMLElement>(".pet-context"); if (menu) menu.hidden = true; });
     this.unlisten.push(window.petAPI.pet.onActivity((snapshot) => this.handleActivity(snapshot)));
@@ -178,6 +186,9 @@ export class PetApp {
     this.unlisten.push(window.petAPI.pet.onScaleFrame(({ scale }) => {
       this.renderedScale = scale;
       this.applySettings();
+    }));
+    this.unlisten.push(window.petAPI.pet.onVisibilityChanged((visible) => {
+      void this.animator.setVisible(visible).finally(() => void window.petAPI.pet.acknowledgeVisibility(visible));
     }));
     this.unlisten.push(window.petAPI.settings.onChanged((settings) => {
       this.settings = settings;
@@ -256,11 +267,13 @@ export class PetApp {
     }
     if (!snapshot.online) { label.textContent = "网络断开"; this.transitionActivity("offline", "OFFLINE", "offline"); return; }
     if (snapshot.batteryPercent <= 20 && !snapshot.charging) { label.textContent = "电量有点低"; this.transitionActivity("low-battery", "LOW_BATTERY", "low_battery"); return; }
-    if (snapshot.locked || snapshot.idleSeconds >= 300) { label.textContent = "休息中"; this.transitionActivity("sleep", "SLEEP", "stand_sleep"); return; }
-    if ((this.settings.reminders.meetingSilent && snapshot.meeting) || (this.settings.reminders.fullscreenSilent && snapshot.fullscreen)) { label.textContent = "静默陪伴"; this.activityMode = "silent"; return; }
-    if (snapshot.keyboardPulse && snapshot.keyboardCount10s > 12) { label.textContent = `${this.categoryName(snapshot.appCategory)}中`; this.transitionActivity("typing-fast", "USER_TYPING", "type_fast"); return; }
-    if (snapshot.keyboardPulse) { label.textContent = "输入中"; this.transitionActivity("typing", "USER_TYPING", "user_typing"); return; }
-    label.textContent = snapshot.activeAppSeconds > 60 ? `${this.categoryName(snapshot.appCategory)}中` : "在你身边";
+    if (snapshot.presenceState === "resting") { label.textContent = "休息中"; this.typingTracker.reset(); this.transitionActivity("sleep", "SLEEP", "stand_sleep"); return; }
+    if (snapshot.presenceState === "away") { label.textContent = "暂离中"; this.typingTracker.reset(); this.transitionActivity("away", "IDLE", "idle_breath"); return; }
+    label.textContent = `${snapshot.applicationLabel} · ${snapshot.activityLabel}`;
+    if ((this.settings.reminders.meetingSilent && snapshot.meeting) || (this.settings.reminders.fullscreenSilent && snapshot.fullscreen)) { this.activityMode = "silent"; return; }
+    const typing = this.typingTracker.update(snapshot.timestamp, snapshot.keyboardPulse, snapshot.keyboardCount10s);
+    if (typing === "fast") { this.transitionActivity("typing-fast", "USER_TYPING", "type_fast"); return; }
+    if (typing === "typing") { this.transitionActivity("typing", "USER_TYPING", "user_typing"); return; }
     if (this.activityMode !== "idle") {
       this.activityMode = "idle";
       if (this.machine.currentState !== "IDLE") this.machine.transition("IDLE", "idle_breath", true);
@@ -270,7 +283,7 @@ export class PetApp {
   private transitionActivity(mode: string, state: PetState, action: string): void {
     if (this.activityMode === mode) return;
     this.activityMode = mode;
-    this.machine.transition(state, action);
+    this.machine.transition(state, action, state === "IDLE");
   }
 
   private isScheduledSilent(now = new Date()): boolean {
@@ -286,8 +299,6 @@ export class PetApp {
     const current = now.getHours() * 60 + now.getMinutes();
     return start < end ? current >= start && current < end : current >= start || current < end;
   }
-
-  private categoryName(category: string): string { return ({ design: "设计", office: "办公", development: "开发", communication: "沟通", entertainment: "休闲", other: "陪伴" } as Record<string, string>)[category] ?? "陪伴"; }
 
   private closeBubble(): void {
     if (this.bubble.hidden || this.bubble.classList.contains("closing")) return;

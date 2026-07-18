@@ -19,12 +19,12 @@ export function buildContentContext(snapshot: ActivitySnapshot, settings: Settin
   const clip = !blocked && settings.sensing.clipboard ? redactContent(clipboard.readText()) : empty;
   return {
     application: settings.sensing.foregroundApp ? snapshot.foregroundProcess : "",
-    category: snapshot.appCategory,
+    category: snapshot.activityKind,
     windowTitle: title.value,
     documentTitle: document.value,
     selectedText: selected.value,
     clipboardText: selected.value ? "" : clip.value,
-    summary: `应用类别=${snapshot.appCategory}; 活跃=${snapshot.activeAppSeconds}s; 输入强度=${snapshot.keyboardCount10s + snapshot.mouseClicks10s}`,
+    summary: `活动=${snapshot.activityLabel}; 活跃=${snapshot.activeAppSeconds}s; 输入强度=${snapshot.keyboardCount10s + snapshot.mouseClicks10s}`,
     blocked,
     redactions: title.count + document.count + selected.count + clip.count
   };

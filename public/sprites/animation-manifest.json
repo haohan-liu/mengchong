@@ -1,8 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canvas": [512, 512],
   "format": "RGBA PNG",
-  "sequence": "runtime_forward_then_reverse",
+  "sequence": "manifest_enter_sustain_exit",
   "frame_pattern": "{action}_{index:03d}.png",
   "actions": {
     "catch_cursor": {"frames": 12, "fps": 12, "loop": false},
@@ -26,8 +26,8 @@
     "success": {"frames": 12, "fps": 12, "loop": false},
     "talk_normal": {"frames": 12, "fps": 12, "loop": true},
     "thinking": {"frames": 12, "fps": 8, "loop": true},
-    "type_fast": {"frames": 12, "fps": 12, "loop": true},
-    "user_typing": {"frames": 10, "fps": 10, "loop": true},
+    "type_fast": {"frames": 12, "fps": 12, "loop": true, "enter": [0, 0], "sustain": [1, 11, "ping-pong"], "exit": [1, 0], "interruptPolicy": "after-exit", "continuityGroup": "typing"},
+    "user_typing": {"frames": 10, "fps": 10, "loop": true, "enter": [0, 0], "sustain": [1, 9, "ping-pong"], "exit": [1, 0], "interruptPolicy": "after-exit", "continuityGroup": "typing"},
     "wave_hello": {"frames": 12, "fps": 10, "loop": true}
   }
 }

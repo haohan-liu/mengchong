@@ -226,6 +226,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
 .conversation-presence.is-working { color: var(--accent); }
 .conversation-presence.is-working i { animation: presence-pulse 1s ease-in-out infinite; }
 .header-actions { display: flex; align-items: center; gap: 7px; }
+.thinking-toggle { display: inline-flex; align-items: center; gap: 6px; height: 22px; border: 0; border-radius: 7px; padding: 0 5px 0 7px; background: transparent; color: var(--text-muted); cursor: pointer; font-size: 9px; font-weight: 620; transition: background .16s ease, color .16s ease; }
+.thinking-toggle:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-secondary); }
+.thinking-toggle i { position: relative; width: 22px; height: 12px; border-radius: 99px; background: var(--border-strong); transition: background .16s ease; }
+.thinking-toggle i::after { position: absolute; top: 2px; left: 2px; width: 8px; height: 8px; border-radius: 50%; background: var(--surface-strong); content: ""; transition: transform .16s ease; }
+.thinking-toggle.is-on { background: color-mix(in srgb, var(--accent) 8%, transparent); color: var(--accent); }
+.thinking-toggle.is-on i { background: var(--accent); }
+.thinking-toggle.is-on i::after { transform: translateX(10px); }
+.thinking-toggle:disabled { cursor: wait; opacity: .65; }
 .status-chip { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; border: 1px solid var(--border-strong); border-radius: 99px; padding: 0 12px; background: var(--surface); color: var(--text-secondary); cursor: pointer; font-size: 10px; font-weight: 560; transition: border-color .16s ease, background .16s ease, transform .16s ease; }
 .status-chip:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); background: var(--surface-hover); color: var(--accent); transform: translateY(-1px); }
 .status-chip.is-protected { border-color: color-mix(in srgb, var(--warning) 32%, var(--border)); color: var(--warning); }
@@ -284,6 +292,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
 .empty-chat h2 { margin: 0; color: var(--text); font-size: 24px; font-weight: 750; letter-spacing: -.035em; }
 .empty-chat > p { max-width: 520px; margin: 10px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.65; }
 .suggestions { display: grid; width: min(660px, 100%); grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 27px; }
+.suggestion-heading { display: flex; width: min(660px, 100%); align-items: center; justify-content: space-between; margin-top: 24px; color: var(--text-muted); font-size: 11px; font-weight: 650; }
+.suggestion-heading + .suggestions { margin-top: 9px; }
+.suggestion-heading button { border: 0; border-radius: 9px; padding: 5px 8px; background: transparent; color: var(--accent); font: inherit; cursor: pointer; }
+.suggestion-heading button:hover:not(:disabled) { background: var(--surface-soft); }
+.suggestion-heading button:disabled { opacity: .58; cursor: wait; }
 .suggestions button { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; column-gap: 10px; border: 1px solid var(--border-strong); border-radius: 15px; padding: 13px; background: color-mix(in srgb, var(--surface) 88%, transparent); color: var(--text); cursor: pointer; text-align: left; transition: border-color .15s ease, transform .15s ease, box-shadow .15s ease, background .15s ease; }
 .suggestions button:hover { border-color: color-mix(in srgb, var(--accent) 38%, var(--border)); background: var(--surface); box-shadow: var(--shadow-md); transform: translateY(-2px); }
 .suggestions button > span { display: grid; width: 32px; height: 32px; grid-row: 1 / span 2; place-items: center; border-radius: 10px; background: var(--surface-soft); color: var(--accent); }
@@ -315,7 +328,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
 .composer-state > span + span::before, .composer-guidance > span + span::before { content: "·"; margin-right: 13px; color: var(--border-strong); }
 .composer-guidance { justify-content: flex-end; }
 .near-limit { color: var(--danger); font-weight: 700; }
-.ai-notice { margin: 5px 0 0; color: var(--text-muted); font-size: 8px; text-align: center; }
 .local-mode-banner { width: min(860px, calc(100% - 20px)); margin: 0 auto 8px; border: 1px solid color-mix(in srgb, var(--warning) 22%, var(--border)); border-radius: 11px; padding: 7px 10px; background: color-mix(in srgb, var(--warning) 8%, var(--surface)); color: var(--warning); font-size: 10px; text-align: center; }
 
 .context-drawer { position: fixed; inset: 0 0 0 auto; width: min(430px, 92vw); max-width: none; height: 100%; max-height: none; margin: 0; border: 0; border-left: 1px solid var(--border); padding: 0; overflow: hidden; background: var(--surface-strong); color: var(--text); box-shadow: -24px 0 64px rgba(48, 30, 38, .18); }
@@ -348,22 +360,42 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
 .drawer-settings:hover { border-color: color-mix(in srgb, var(--accent) 34%, var(--border)); color: var(--accent); }
 .drawer-settings svg { width: 15px; }
 
-.approval-dialog, .rename-dialog, .delete-dialog { width: min(440px, calc(100vw - 32px)); border: 1px solid var(--border-strong); border-radius: 20px; padding: 0; background: var(--surface-strong); color: var(--text); box-shadow: var(--shadow-lg); }
+.approval-dialog { width: min(590px, calc(100vw - 32px)); }
+.approval-dialog, .rename-dialog, .delete-dialog { border: 1px solid var(--border-strong); border-radius: 20px; padding: 0; background: var(--surface-strong); color: var(--text); box-shadow: var(--shadow-lg); }
+.rename-dialog, .delete-dialog { width: min(440px, calc(100vw - 32px)); }
 .approval-dialog::backdrop, .rename-dialog::backdrop, .delete-dialog::backdrop { background: rgba(42, 29, 35, .34); backdrop-filter: blur(3px); }
 .approval-dialog form, .rename-dialog form, .delete-dialog form { padding: 24px; }
+.approval-dialog form { display: grid; gap: 14px; }
 .approval-icon, .danger-icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 13px; background: color-mix(in srgb, var(--accent) 10%, var(--surface)); color: var(--accent); }
 .danger-icon { background: color-mix(in srgb, var(--danger) 10%, var(--surface)); color: var(--danger); }
-.approval-dialog h2, .rename-dialog h2, .delete-dialog h2 { margin: 15px 0 7px; font-size: 17px; }
+.approval-header { display: flex; align-items: flex-start; gap: 12px; }
+.approval-header > div { min-width: 0; }
+.approval-dialog h2, .rename-dialog h2, .delete-dialog h2 { margin: 7px 0 0; font-size: 18px; line-height: 1.25; }
+.approval-mode { display: inline-flex; border: 1px solid color-mix(in srgb, var(--warning) 25%, var(--border)); border-radius: 99px; padding: 4px 8px; background: color-mix(in srgb, var(--warning) 10%, var(--surface)); color: var(--warning); font-size: 9px; font-weight: 720; }
 .rename-dialog h2 { margin-top: 0; }
 .approval-dialog p, .rename-dialog p, .delete-dialog p { margin: 0; color: var(--text-secondary); font-size: 11px; line-height: 1.6; }
-.approval-dialog pre { max-height: 190px; overflow: auto; border: 1px solid var(--border); border-radius: 12px; padding: 12px; background: var(--surface-soft); color: var(--text); font: 10px Consolas, monospace; white-space: pre-wrap; }
+.approval-copy { color: var(--text) !important; font-size: 12px !important; font-weight: 650; }
+.approval-guidance { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.approval-guidance p { display: grid; gap: 4px; min-height: 84px; border: 1px solid var(--border); border-radius: 12px; padding: 10px 11px; background: var(--surface-soft); }
+.approval-guidance p:last-child { border-color: color-mix(in srgb, var(--accent) 25%, var(--border)); background: color-mix(in srgb, var(--accent) 5%, var(--surface-soft)); }
+.approval-guidance b { color: var(--text); font-size: 10px; }
+.approval-guidance span { color: var(--text-secondary); font-size: 9.5px; line-height: 1.5; }
+.approval-dialog pre { max-height: 136px; overflow: auto; margin: 0; border: 1px solid var(--border); border-radius: 12px; padding: 11px 12px; background: var(--surface-soft); color: var(--text); font: 10px Consolas, monospace; white-space: pre-wrap; }
 .rename-dialog label { display: block; margin-top: 15px; color: var(--text-secondary); font-size: 10px; font-weight: 650; }
 .rename-dialog input { width: 100%; height: 42px; margin-top: 6px; border: 1px solid var(--border-strong); border-radius: 11px; padding: 0 12px; background: var(--surface); color: var(--text); }
 .rename-dialog input:focus { border-color: color-mix(in srgb, var(--accent) 48%, var(--border)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 9%, transparent); }
-.approval-dialog form > div, .rename-dialog form > div, .delete-dialog form > div { display: flex; justify-content: flex-end; gap: 9px; margin-top: 19px; }
+.approval-dialog .approval-actions, .rename-dialog form > div, .delete-dialog form > div { display: flex; justify-content: flex-end; gap: 9px; margin-top: 5px; }
 .approval-dialog button, .rename-dialog button, .delete-dialog button { min-height: 37px; border: 1px solid var(--border-strong); border-radius: 10px; padding: 0 14px; background: var(--surface); color: var(--text); cursor: pointer; font-size: 10px; font-weight: 620; }
 .approval-dialog button.approve, .rename-dialog button.save { border-color: var(--accent); background: var(--accent); color: #fff; }
+.approval-dialog button.approve-once { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); color: var(--accent); }
 .delete-dialog button.delete-confirm { border-color: var(--danger); background: var(--danger); color: #fff; }
+
+@media (max-width: 560px) {
+  .approval-guidance { grid-template-columns: 1fr; }
+  .approval-guidance p { min-height: 0; }
+  .approval-dialog .approval-actions { flex-wrap: wrap; }
+  .approval-dialog .approval-actions button { flex: 1 1 130px; }
+}
 
 .toast { position: fixed; z-index: 100; left: 50%; bottom: 26px; max-width: min(420px, calc(100vw - 32px)); transform: translateX(-50%); border: 1px solid var(--border-strong); border-radius: 12px; padding: 10px 14px; background: var(--surface-strong); color: var(--text); box-shadow: var(--shadow-lg); font-size: 11px; animation: toast-in .18s ease; }
 .toast[data-tone="success"] { border-color: color-mix(in srgb, var(--success) 35%, var(--border)); color: var(--success); }
@@ -415,6 +447,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
   .message.user .message-body { max-width: 86%; }
   .message.assistant .message-body { max-width: 92%; }
   .suggestions { grid-template-columns: 1fr; width: min(390px, 100%); }
+  .suggestion-heading { width: min(390px, 100%); }
   .composer-area { padding-right: 10px; padding-left: 10px; }
   .composer-state span:last-child, .composer-guidance span:last-child { display: none; }
   .composer-state > span + span::before, .composer-guidance > span + span::before { display: none; }

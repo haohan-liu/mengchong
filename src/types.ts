@@ -1,5 +1,19 @@
 export type PlayMode = "loop" | "once";
 
+export type FramePlaybackMode = "forward" | "ping-pong";
+export interface AnimationPhase {
+  from: number;
+  to: number;
+  mode?: FramePlaybackMode;
+}
+export interface AnimationPlayback {
+  enter?: AnimationPhase;
+  sustain?: AnimationPhase;
+  exit?: AnimationPhase;
+  interruptPolicy: "immediate" | "after-exit";
+  continuityGroup?: string;
+}
+
 export interface AnimationDefinition {
   id: string;
   category: string;
@@ -9,6 +23,7 @@ export interface AnimationDefinition {
   playMode: PlayMode;
   prompt: string;
   returnTo: string | null;
+  playback?: AnimationPlayback;
 }
 
 export type DragDirection = "left" | "right";
@@ -28,7 +43,16 @@ export type PetState =
   | "THINKING" | "RESPONDING" | "SUCCESS" | "ERROR" | "OFFLINE"
   | "LOW_BATTERY" | "SLEEP" | "DRAGGING" | "REACTION" | "DISAPPEAR";
 
-export type AppCategory = "design" | "office" | "development" | "communication" | "entertainment" | "other";
+export const activityKinds = [
+  "designing", "modeling", "rendering", "video-editing", "developing", "editing",
+  "spreadsheet", "presentation", "reading", "meeting", "communicating", "browsing",
+  "searching", "ai-chat", "learning", "file-management", "watching", "listening",
+  "gaming", "other"
+] as const;
+export type ActivityKind = typeof activityKinds[number];
+export type ActivityGroup = "productivity" | "collaboration" | "browser" | "files" | "media" | "other";
+export type ClassificationSource = "manual" | "builtin" | "learned" | "ai" | "fallback";
+export type PresenceState = "active" | "away" | "resting";
 
 export interface PerformanceSnapshot {
   systemCpuPercent: number;
@@ -46,7 +70,12 @@ export interface ActivitySnapshot {
   foregroundPath: string;
   windowTitle: string;
   documentTitle: string;
-  appCategory: AppCategory;
+  activityKind: ActivityKind;
+  activityLabel: string;
+  applicationLabel: string;
+  classificationSource: ClassificationSource;
+  classificationConfidence: number;
+  presenceState: PresenceState;
   activeAppSeconds: number;
   appSwitches5m: number;
   keyboardCount1s: number;
@@ -73,7 +102,7 @@ export interface ActivitySnapshot {
 
 export interface ContentContext {
   application: string;
-  category: AppCategory;
+  category: ActivityKind;
   windowTitle: string;
   documentTitle: string;
   selectedText: string;
@@ -109,6 +138,7 @@ export interface SensingSettings {
   power: boolean;
   network: boolean;
   autoContext: boolean;
+  smartActivityLearning: boolean;
   blockedApps: string[];
   allowedApps: string[];
 }
@@ -128,6 +158,12 @@ export interface ReminderSettings {
   startupDelaySeconds: number;
 }
 
+export interface AppNotification {
+  title: string;
+  body: string;
+  kind: "reminder" | "assistant";
+}
+
 export interface AiSettings {
   baseUrl: string;
   model: "deepseek-v4-flash" | "deepseek-v4-pro";
@@ -137,6 +173,7 @@ export interface AiSettings {
   includeContext: boolean;
   toolPermissions: {
     open_url: "ask" | "allow" | "deny";
+    launch_app: "ask" | "allow" | "deny";
     read_current_context: "ask" | "allow" | "deny";
   };
 }
@@ -158,19 +195,34 @@ export interface Settings {
 export interface DailyStatistic {
   date: string;
   activeSeconds: number;
-  focusSeconds: number;
+  restSeconds: number;
+  productiveSeconds: number;
   inputEvents: number;
   appSwitches: number;
   breaksCompleted: number;
   hydrationCompleted: number;
   aiCalls: number;
   localReplies: number;
-  categories: Record<AppCategory, number>;
+  categories: Record<ActivityKind, number>;
+}
+
+export interface ActivityRule {
+  id: string;
+  processName: string;
+  titleKeywords: string[];
+  applicationLabel: string;
+  activityKind: ActivityKind;
+  source: "manual" | "learned";
+  confidence: number;
+  hitCount: number;
+  lastUsedAt: number;
+  pinned: boolean;
 }
 
 export interface StatisticsSummary {
   today: DailyStatistic;
   days: DailyStatistic[];
+  monthlyAiCalls: number;
 }
 
 export interface ChatMessage {

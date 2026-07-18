@@ -1,11 +1,11 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Notification, screen, shell, Tray } from "electron";
-import { readFile } from "node:fs/promises";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, screen, shell, Tray } from "electron";
+import { access, readFile, rm } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
-import type { ActivitySnapshot, PetRuntimeStatus, PetSpeechKind, PetState, Settings, UpdateStatus } from "../src/types.js";
+import type { ActivitySnapshot, AppNotification, PetRuntimeStatus, PetSpeechKind, PetState, Settings, UpdateStatus } from "../src/types.js";
 import { isDirectionalDragAction } from "../src/types.js";
 import { DRAG_RELEASE_SAMPLE_WINDOW_MS, dragGlideForRelease, type TimedDragPoint } from "../src/drag-motion.js";
-import { defaultSettings, SettingsStore } from "./services/SettingsStore.js";
+import { SettingsStore } from "./services/SettingsStore.js";
 import { DataStore } from "./services/DataStore.js";
 import { SensorService } from "./services/SensorService.js";
 import { DeepSeekAgent } from "./services/DeepSeekAgent.js";
@@ -13,6 +13,8 @@ import { migrateDataDirectory } from "./services/StorageMigration.js";
 import { AgentTools } from "./services/AgentTools.js";
 import { ReminderScheduler } from "./services/ReminderScheduler.js";
 import { UpdateService } from "./services/UpdateService.js";
+import { ActivityRuleStore } from "./services/ActivityRuleStore.js";
+import { ActivityClassifier } from "./services/ActivityClassifier.js";
 
 const APP_STATES = new Set<PetState>(["BOOT", "APPEAR", "IDLE", "LISTENING", "USER_TYPING", "THINKING", "RESPONDING", "SUCCESS", "ERROR", "OFFLINE", "LOW_BATTERY", "SLEEP", "DRAGGING", "REACTION", "DISAPPEAR"]);
 const RELEASES_URL = "https://github.com/haohan-liu/mengchong-exe/releases";
@@ -43,6 +45,10 @@ let petWindow: BrowserWindow | null = null;
 let consoleWindow: BrowserWindow | null = null;
 let consoleRequestedTab = "home";
 let chatWindow: BrowserWindow | null = null;
+let updatePopupWindow: BrowserWindow | null = null;
+let notificationPopupWindow: BrowserWindow | null = null;
+let notificationPopupTimer: NodeJS.Timeout | null = null;
+let currentAppNotification: AppNotification = { title: "提醒", body: "", kind: "reminder" };
 let tray: Tray | null = null;
 let settingsStore: SettingsStore;
 let dataStore: DataStore;
@@ -50,6 +56,7 @@ let sensor: SensorService;
 let agent: DeepSeekAgent;
 let agentTools: AgentTools;
 let updateService: UpdateService;
+let activityClassifier: ActivityClassifier;
 const reminderScheduler = new ReminderScheduler();
 interface ScreenPoint { x: number; y: number; }
 interface DragSession {
@@ -69,7 +76,8 @@ let proactivePending = false;
 let writesPaused = false;
 let flushingQuit = false;
 let petVisibilityTarget = true;
-let lastUpdateNotificationPhase = "";
+let pendingVisibilityAcknowledge: { visible: boolean; resolve: () => void } | null = null;
+let lastUpdatePopupPhase = "";
 let visibilityAnimationToken = 0;
 let petScaleAnimationTimer: NodeJS.Timeout | null = null;
 let petScaleAnimation: { targetScale: number; anchorRight: number; anchorBottom: number } | null = null;
@@ -78,7 +86,9 @@ const runtime: PetRuntimeStatus = {
   state: "BOOT", action: "idle_breath", source: "startup", sensingPausedUntil: null,
   activity: {
     timestamp: Date.now(), foregroundProcess: "unknown", foregroundPath: "", windowTitle: "", documentTitle: "",
-    appCategory: "other", activeAppSeconds: 0, appSwitches5m: 0,
+    activityKind: "other", activityLabel: "其他", applicationLabel: "未知软件",
+    classificationSource: "fallback", classificationConfidence: 0, presenceState: "active",
+    activeAppSeconds: 0, appSwitches5m: 0,
     keyboardCount1s: 0, keyboardCount10s: 0, keyboardPulse: false,
     mouseClicks1s: 0, mouseClicks10s: 0, mouseClickPulse: false,
     mouseWheel1s: 0, mouseWheel10s: 0, mouseDistance1s: 0, mouseDistance10s: 0,
@@ -100,7 +110,7 @@ function appIcon() {
   return icon.isEmpty() ? nativeImage.createEmpty() : icon;
 }
 
-function reportRendererHealth(window: BrowserWindow, label: "pet" | "console" | "chat"): void {
+function reportRendererHealth(window: BrowserWindow, label: "pet" | "console" | "chat" | "update" | "notification"): void {
   window.webContents.on("preload-error", (_event, path, error) => {
     console.error(`[${label}] preload failed: ${path}`, error);
   });
@@ -115,7 +125,7 @@ function reportRendererHealth(window: BrowserWindow, label: "pet" | "console" | 
   });
 }
 
-async function loadRenderer(window: BrowserWindow, page: "index.html" | "console.html" | "chat.html"): Promise<void> {
+async function loadRenderer(window: BrowserWindow, page: "index.html" | "console.html" | "chat.html" | "update.html" | "notification.html"): Promise<void> {
   const devUrl = process.env.PET_DEV_URL;
   if (devUrl) await window.loadURL(`${devUrl}/${page}`);
   else await window.loadFile(join(appRoot(), "dist", page));
@@ -249,6 +259,10 @@ async function setPetVisibility(visible: boolean): Promise<void> {
     window.showInactive();
     reassertPetTopmost();
   }
+  // Also send the restore signal when a hide animation is cancelled midway.
+  // In that case the native window never became hidden, but the renderer may
+  // already have released its frames in response to the prior hide request.
+  if (visible) await notifyPetRendererVisibility(window, true);
   const from = window.getOpacity();
   const to = visible ? 1 : 0;
   const startedAt = Date.now();
@@ -262,9 +276,25 @@ async function setPetVisibility(visible: boolean): Promise<void> {
   if (token !== visibilityAnimationToken || window.isDestroyed()) return;
   window.setOpacity(to);
   if (!visible) {
+    await notifyPetRendererVisibility(window, false);
+    if (token !== visibilityAnimationToken || window.isDestroyed()) return;
     window.hide();
     window.setOpacity(1);
   }
+}
+
+async function notifyPetRendererVisibility(window: BrowserWindow, visible: boolean): Promise<void> {
+  if (window.isDestroyed()) return;
+  pendingVisibilityAcknowledge?.resolve();
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      if (pendingVisibilityAcknowledge?.resolve === finish) pendingVisibilityAcknowledge = null;
+      resolve();
+    }, 180);
+    const finish = () => { clearTimeout(timeout); resolve(); };
+    pendingVisibilityAcknowledge = { visible, resolve: finish };
+    window.webContents.send("pet:visibility-changed", visible);
+  });
 }
 
 async function animatePetEntrance(window: BrowserWindow): Promise<void> {
@@ -451,6 +481,98 @@ async function openChat(): Promise<void> {
   await loadRenderer(window, "chat.html");
 }
 
+function updatePopupPosition(width: number, height: number): { x: number; y: number } {
+  const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
+  return {
+    x: area.x + area.width - width - 22,
+    y: area.y + area.height - height - 22
+  };
+}
+
+function notificationPopupPosition(width: number, height: number): { x: number; y: number } {
+  const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
+  // 更新卡片始终占据最底部；普通提醒在它出现时顺延到上方，避免两个全局提示互相遮挡。
+  const updateOffset = updatePopupWindow && !updatePopupWindow.isDestroyed() && updatePopupWindow.isVisible() ? 290 : 0;
+  return { x: area.x + area.width - width - 22, y: area.y + area.height - height - 22 - updateOffset };
+}
+
+function closeNotificationPopup(): void {
+  if (notificationPopupTimer) clearTimeout(notificationPopupTimer);
+  notificationPopupTimer = null;
+  if (notificationPopupWindow && !notificationPopupWindow.isDestroyed()) notificationPopupWindow.close();
+}
+
+async function showAppNotification(notification: AppNotification): Promise<void> {
+  currentAppNotification = notification;
+  const width = 390, height = 132;
+  if (notificationPopupWindow && !notificationPopupWindow.isDestroyed()) {
+    const position = notificationPopupPosition(width, height);
+    notificationPopupWindow.setPosition(position.x, position.y, false);
+    notificationPopupWindow.webContents.send("notification-popup:changed", notification);
+    notificationPopupWindow.showInactive();
+  } else {
+    const position = notificationPopupPosition(width, height);
+    notificationPopupWindow = new BrowserWindow({
+      width, height, x: position.x, y: position.y, useContentSize: true, show: false,
+      frame: false, transparent: true, resizable: false, maximizable: false, minimizable: false,
+      skipTaskbar: true, alwaysOnTop: true, hasShadow: false, icon: appIcon(),
+      webPreferences: { preload: preloadPath(), contextIsolation: true, nodeIntegration: false, sandbox: true }
+    });
+    const window = notificationPopupWindow;
+    reportRendererHealth(window, "notification");
+    window.setMenu(null);
+    window.setAlwaysOnTop(true, "floating");
+    const reveal = () => { if (!window.isDestroyed()) window.showInactive(); };
+    window.once("ready-to-show", reveal);
+    window.webContents.once("did-finish-load", reveal);
+    window.on("closed", () => { if (notificationPopupWindow === window) notificationPopupWindow = null; });
+    await loadRenderer(window, "notification.html");
+  }
+  if (notificationPopupTimer) clearTimeout(notificationPopupTimer);
+  notificationPopupTimer = setTimeout(closeNotificationPopup, 9_000);
+}
+
+async function showUpdatePopup(): Promise<void> {
+  if (updatePopupWindow && !updatePopupWindow.isDestroyed()) {
+    updatePopupWindow.showInactive();
+    return;
+  }
+  const width = 420;
+  const height = 278;
+  const position = updatePopupPosition(width, height);
+  if (notificationPopupWindow && !notificationPopupWindow.isDestroyed()) {
+    const notificationPosition = notificationPopupPosition(390, 132);
+    notificationPopupWindow.setPosition(notificationPosition.x, notificationPosition.y, false);
+  }
+  updatePopupWindow = new BrowserWindow({
+    width,
+    height,
+    x: position.x,
+    y: position.y,
+    useContentSize: true,
+    show: false,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    hasShadow: false,
+    icon: appIcon(),
+    webPreferences: { preload: preloadPath(), contextIsolation: true, nodeIntegration: false, sandbox: true }
+  });
+  const window = updatePopupWindow;
+  reportRendererHealth(window, "update");
+  window.setMenu(null);
+  window.setAlwaysOnTop(true, "floating");
+  const reveal = () => { if (!window.isDestroyed()) window.showInactive(); };
+  window.once("ready-to-show", reveal);
+  window.webContents.once("did-finish-load", reveal);
+  window.on("closed", () => { if (updatePopupWindow === window) updatePopupWindow = null; });
+  await loadRenderer(window, "update.html");
+}
+
 function createTray(): void {
   const candidates = [appIconPath(), join(appRoot(), "assets", "generated", "character-anchor.png"), join(process.resourcesPath, "character-anchor.png")];
   let icon = nativeImage.createEmpty();
@@ -473,14 +595,14 @@ function buildTrayMenu(petName: string): Menu {
   const sensingEnabled = settings.firstRunConsent && settings.sensing.enabled && !runtime.sensingPausedUntil;
   return Menu.buildFromTemplate([
     { label: "打开控制台", click: () => void openConsole() },
-    { label: "聊天", click: () => void openChat() },
+    { label: `和${petName}聊天`, click: () => void openChat() },
     { label: "说句话", click: () => void setPetVisibility(true).then(() => showPetSpeech("proactive")) },
     { type: "separator" },
     { label: `节能：${energySaving ? "开" : "关"}`, click: () => void toggleEnergySaving() },
     { label: `感知：${sensingEnabled ? "开" : "关"}`, click: () => void toggleTraySensing() },
     { type: "separator" },
     { label: petVisibilityTarget ? "隐藏桌宠" : "显示桌宠", click: () => void setPetVisibility(!petVisibilityTarget) },
-    { label: "退出", click: () => app.quit() }
+    { label: "退出桌宠", click: () => app.quit() }
   ]);
 }
 
@@ -506,6 +628,7 @@ async function toggleTraySensing(): Promise<void> {
     setSensingPausedUntil(null);
   }
   const saved = await settingsStore.save(settings);
+  syncSensorForSettings(saved);
   runtime.activity = filterActivity(runtime.activity, saved);
   broadcastRuntimeStatus();
   petWindow?.webContents.send("settings:changed", saved);
@@ -577,18 +700,10 @@ function broadcastRuntimeStatus(): void {
 
 function broadcastUpdateStatus(status: UpdateStatus): void {
   consoleWindow?.webContents.send("updates:changed", status);
-  if (status.phase === lastUpdateNotificationPhase) return;
-  lastUpdateNotificationPhase = status.phase;
-  if (status.phase === "available") {
-    const notification = new Notification({ title: `${settingsStore.get().petName}桌宠有新版本`, body: `${status.availableVersion ?? "新版本"} 已准备好，点击查看更新` });
-    notification.on("click", () => void openConsole("updates"));
-    notification.show();
-  }
-  if (status.phase === "downloaded") {
-    const notification = new Notification({ title: "桌宠更新已下载", body: "点击打开控制台，重启并完成安装" });
-    notification.on("click", () => void openConsole("updates"));
-    notification.show();
-  }
+  updatePopupWindow?.webContents.send("updates:changed", status);
+  if (status.phase === lastUpdatePopupPhase) return;
+  lastUpdatePopupPhase = status.phase;
+  if (status.phase === "available" || status.phase === "downloaded") void showUpdatePopup();
 }
 
 async function syncUninstallDataPath(dataDirectory: string): Promise<void> {
@@ -601,6 +716,33 @@ async function syncUninstallDataPath(dataDirectory: string): Promise<void> {
   });
 }
 
+async function resetLocalData(removeMarkedCustomDirectory: boolean): Promise<Settings> {
+  writesPaused = true;
+  sensor?.stop();
+  activityClassifier?.cancelPending();
+  const previousDirectory = settingsStore.get().dataDirectory;
+  try {
+    await Promise.all([dataStore.clearChats(), dataStore.clearStatistics(), dataStore.clearUsage(), activityClassifier.clear()]);
+    const saved = await settingsStore.clearAndReset();
+    activityClassifier.setApiConfigured(false);
+    if (removeMarkedCustomDirectory && previousDirectory !== saved.dataDirectory) {
+      try {
+        await access(join(previousDirectory, ".qpet-data-root"));
+        await rm(previousDirectory, { recursive: true, force: true });
+      } catch {
+        // External directories without the application marker are never removed recursively.
+      }
+    }
+    await dataStore.load();
+    await activityClassifier.rules.load();
+    await syncUninstallDataPath(saved.dataDirectory);
+    runtime.activity = filterActivity(runtime.activity, saved);
+    return saved;
+  } finally {
+    writesPaused = false;
+  }
+}
+
 function setSensingPausedUntil(until: number | null): void {
   if (sensingPauseTimer) { clearTimeout(sensingPauseTimer); sensingPauseTimer = null; }
   runtime.sensingPausedUntil = until && until > Date.now() ? until : null;
@@ -608,18 +750,22 @@ function setSensingPausedUntil(until: number | null): void {
     sensingPauseTimer = setTimeout(() => {
       sensingPauseTimer = null;
       runtime.sensingPausedUntil = null;
+      syncSensorForSettings(settingsStore.get());
       broadcastRuntimeStatus();
     }, Math.max(1, runtime.sensingPausedUntil - Date.now() + 50));
   }
+  syncSensorForSettings(settingsStore.get());
   broadcastRuntimeStatus();
   tray?.setContextMenu(buildTrayMenu(settingsStore.get().petName));
 }
 
 function filterActivity(snapshot: ActivitySnapshot, settings: Settings): ActivitySnapshot {
-  const active = settings.firstRunConsent && settings.sensing.enabled && (!runtime.sensingPausedUntil || runtime.sensingPausedUntil <= Date.now());
+  const active = shouldRunSensor(settings);
   const result = structuredClone(snapshot);
   if (!active || !settings.sensing.foregroundApp) {
-    result.foregroundProcess = "未启用"; result.foregroundPath = ""; result.appCategory = "other";
+    result.foregroundProcess = "unknown"; result.foregroundPath = "";
+    result.activityKind = "other"; result.activityLabel = "其他"; result.applicationLabel = "未知软件";
+    result.classificationSource = "fallback"; result.classificationConfidence = 0;
     result.activeAppSeconds = 0; result.appSwitches5m = 0;
   }
   if (!active || !settings.sensing.windowTitle) { result.windowTitle = ""; result.documentTitle = ""; }
@@ -633,6 +779,17 @@ function filterActivity(snapshot: ActivitySnapshot, settings: Settings): Activit
   if (!active || !settings.sensing.power) { result.batteryPercent = 100; result.charging = true; }
   if (!active || !settings.sensing.network) result.online = true;
   return result;
+}
+
+function shouldRunSensor(settings: Settings): boolean {
+  // Energy-saving mode keeps the pet visible and interactive, but releases
+  // the separate native sensing process until the user returns to auto mode.
+  return settings.firstRunConsent && settings.sensing.enabled && !runtime.sensingPausedUntil && settings.manualMode !== "energy_saving";
+}
+
+function syncSensorForSettings(settings: Settings): void {
+  if (shouldRunSensor(settings)) sensor.start();
+  else sensor.stop();
 }
 
 function isScheduledSilent(settings: Settings, now = new Date()): boolean {
@@ -650,29 +807,34 @@ function isScheduledSilent(settings: Settings, now = new Date()): boolean {
   return start < end ? current >= start && current < end : current >= start || current < end;
 }
 
-async function showPetSpeech(kind: PetSpeechKind): Promise<boolean> {
+async function showPetSpeech(kind: PetSpeechKind): Promise<string | null> {
   const window = petWindow;
-  if (!window || window.isDestroyed() || !window.isVisible()) return false;
+  if (!window || window.isDestroyed() || !window.isVisible()) return null;
   const text = await agent.nextCompanionLine(kind);
-  if (!text.trim() || window.isDestroyed()) return false;
+  if (!text.trim() || window.isDestroyed()) return null;
   window.webContents.send("pet:speech", { text, kind });
-  return true;
+  return text;
 }
 
 async function maybeSendProactive(snapshot: ActivitySnapshot, settings: Settings): Promise<void> {
   const now = Date.now();
   const cooldownMs = Math.max(1, settings.reminders.proactiveCooldownMinutes) * 60_000;
   const limit = Math.max(0, Math.round(settings.reminders.proactiveDailyLimit));
-  const sensingActive = settings.firstRunConsent && settings.sensing.enabled && (!runtime.sensingPausedUntil || runtime.sensingPausedUntil <= now);
+  const sensingActive = shouldRunSensor(settings);
   const silent = isScheduledSilent(settings) || snapshot.locked || snapshot.idleSeconds >= 60
     || (settings.reminders.meetingSilent && snapshot.meeting)
     || (settings.reminders.fullscreenSilent && snapshot.fullscreen);
-  if (proactivePending || settings.manualMode !== "auto" || !sensingActive || silent || !snapshot.online
+  // 内置陪伴文案不依赖网络；离线时也应继续按用户设置陪伴，而不是让“主动次数”静默失效。
+  if (proactivePending || settings.manualMode !== "auto" || !sensingActive || silent
     || limit === 0 || dataStore.getProactiveCount(now) >= limit || now - lastProactiveAt < cooldownMs) return;
   proactivePending = true;
   lastProactiveAt = now;
   try {
-    if (await showPetSpeech("proactive")) dataStore.incrementProactive(now);
+    const text = await showPetSpeech("proactive");
+    if (text) {
+      dataStore.incrementProactive(now);
+      void showAppNotification({ title: `${settings.petName}在陪你`, body: text, kind: "assistant" });
+    }
   } finally {
     proactivePending = false;
   }
@@ -1021,6 +1183,14 @@ function registerIpc(): void {
     finishDragWithInertia(session);
   });
   ipcMain.handle("pet:hide", () => setPetVisibility(false));
+  ipcMain.handle("pet:visibility-ack", (event, visible: boolean) => {
+    if (event.sender !== petWindow?.webContents) return false;
+    if (pendingVisibilityAcknowledge?.visible !== Boolean(visible)) return false;
+    const pending = pendingVisibilityAcknowledge;
+    pendingVisibilityAcknowledge = null;
+    pending.resolve();
+    return true;
+  });
   ipcMain.handle("pet:runtime", () => structuredClone(runtime));
   ipcMain.handle("pet:pause-sensing", (_event, minutes: number) => {
     setSensingPausedUntil(Date.now() + Math.max(1, Math.min(1440, Number(minutes) || 10)) * 60_000);
@@ -1080,13 +1250,15 @@ function registerIpc(): void {
   ipcMain.handle("console:close", () => consoleWindow?.close());
   ipcMain.handle("chat:open", () => openChat());
   ipcMain.handle("chat:close", () => chatWindow?.close());
+  ipcMain.handle("app:quit", () => app.quit());
 
   ipcMain.handle("settings:get", () => settingsStore.get());
   ipcMain.handle("settings:update", async (_event, settings: Settings) => {
     const previous = settingsStore.get();
     const saved = await settingsStore.save(settings);
     if ((!previous.sensing.enabled && saved.sensing.enabled) || (!previous.firstRunConsent && saved.firstRunConsent && saved.sensing.enabled)) setSensingPausedUntil(null);
-    if (previous.sensing.enabled !== saved.sensing.enabled || previous.firstRunConsent !== saved.firstRunConsent) {
+    if (shouldRunSensor(previous) !== shouldRunSensor(saved)) syncSensorForSettings(saved);
+    if (previous.sensing.enabled !== saved.sensing.enabled || previous.firstRunConsent !== saved.firstRunConsent || previous.manualMode !== saved.manualMode) {
       runtime.activity = filterActivity(runtime.activity, saved);
       broadcastRuntimeStatus();
     }
@@ -1098,6 +1270,8 @@ function registerIpc(): void {
     petWindow?.webContents.send("settings:changed", saved);
     consoleWindow?.webContents.send("settings:changed", saved);
     chatWindow?.webContents.send("settings:changed", saved);
+    updatePopupWindow?.webContents.send("settings:changed", saved);
+    notificationPopupWindow?.webContents.send("settings:changed", saved);
     if (previous.manualMode !== saved.manualMode || previous.manualState !== saved.manualState || previous.manualUntil !== saved.manualUntil) applyManualMode(saved);
     return saved;
   });
@@ -1109,6 +1283,7 @@ function registerIpc(): void {
   });
   ipcMain.handle("settings:set-api-key", async (_event, value: string) => {
     const saved = await settingsStore.setApiKey(value);
+    activityClassifier.setApiConfigured(saved && Boolean(value.trim()));
     if (saved && value.trim()) void agent.warmCompanionLines(true);
     return saved;
   });
@@ -1130,6 +1305,8 @@ function registerIpc(): void {
       next.dataDirectory = nextPath;
       await settingsStore.save(next);
       await dataStore.load();
+      activityClassifier.cancelPending();
+      await activityClassifier.rules.load();
       await syncUninstallDataPath(nextPath);
       if (chatWindow && !chatWindow.isDestroyed()) chatWindow.webContents.reload();
       return nextPath;
@@ -1138,28 +1315,49 @@ function registerIpc(): void {
 
   ipcMain.handle("statistics:get", (_event, days: number) => dataStore.getStatistics(Math.min(90, Math.max(1, Number(days) || 30))));
   ipcMain.handle("statistics:clear", () => dataStore.clearStatistics().then(() => true));
+  ipcMain.handle("activity-rules:list", () => activityClassifier.rules.list());
+  ipcMain.handle("activity-rules:update", (_event, id: string, changes: unknown) => activityClassifier.rules.update(String(id), changes as never));
+  ipcMain.handle("activity-rules:delete", (_event, id: string) => activityClassifier.rules.remove(String(id)));
+  ipcMain.handle("activity-rules:clear", () => activityClassifier.clear().then(() => true));
   ipcMain.handle("updates:status", () => updateService.status());
   ipcMain.handle("updates:check", () => updateService.check());
   ipcMain.handle("updates:download", () => updateService.download());
   ipcMain.handle("updates:install", () => updateService.install());
   ipcMain.handle("updates:open-releases", () => shell.openExternal(RELEASES_URL));
+  ipcMain.handle("update-popup:close", (event) => {
+    if (event.sender === updatePopupWindow?.webContents) updatePopupWindow.close();
+  });
+  ipcMain.handle("notification-popup:current", () => currentAppNotification);
+  ipcMain.handle("notification-popup:close", (event) => {
+    if (event.sender === notificationPopupWindow?.webContents) closeNotificationPopup();
+  });
+  ipcMain.handle("notification-popup:open-reminders", async (event) => {
+    if (event.sender === notificationPopupWindow?.webContents) closeNotificationPopup();
+    await openConsole("reminders");
+  });
+  ipcMain.handle("notification-popup:open-chat", async (event) => {
+    if (event.sender === notificationPopupWindow?.webContents) closeNotificationPopup();
+    await openChat();
+  });
   ipcMain.handle("storage:clear-chats", async () => {
     await dataStore.clearChats();
     if (chatWindow && !chatWindow.isDestroyed()) chatWindow.webContents.reload();
     return true;
   });
   ipcMain.handle("storage:reset-all", async () => {
-    await Promise.all([dataStore.clearChats(), dataStore.clearStatistics()]);
-    const previous = settingsStore.get();
-    const next = defaultSettings();
-    next.dataDirectory = previous.dataDirectory;
-    next.firstRunConsent = previous.firstRunConsent;
-    const saved = await settingsStore.save(next);
+    const saved = await resetLocalData(true);
+    syncSensorForSettings(saved);
     applyAppearance(saved);
     petWindow?.webContents.send("settings:changed", saved);
     consoleWindow?.webContents.send("settings:changed", saved);
     chatWindow?.webContents.send("settings:changed", saved);
     if (chatWindow && !chatWindow.isDestroyed()) chatWindow.webContents.reload();
+    return true;
+  });
+  ipcMain.handle("storage:clear-all", async () => {
+    await resetLocalData(true);
+    app.relaunch();
+    setTimeout(() => app.exit(0), 100);
     return true;
   });
 
@@ -1177,8 +1375,10 @@ function registerIpc(): void {
   ipcMain.handle("chat:list", () => dataStore.listChats());
   ipcMain.handle("chat:messages", (_event, sessionId: string, cursor?: number, limit?: number) => dataStore.messages(String(sessionId), cursor, limit));
   ipcMain.handle("chat:status", () => agent.status());
+  ipcMain.handle("chat:suggestions", () => agent.suggestions());
   ipcMain.handle("chat:context-preview", () => agent.contextPreview());
-  ipcMain.handle("agent:approval", (_event, id: string, approved: boolean) => agentTools.resolve(id, approved));
+  ipcMain.handle("agent:approval", (_event, id: string, approved: boolean, allowConversation?: boolean, conversationId?: string) => agentTools.resolve(id, approved, Boolean(allowConversation), String(conversationId ?? "")));
+  ipcMain.handle("agent:approval:clear", (event) => agentTools.clearConversationApprovals(event.sender));
 }
 
 async function bootstrap(): Promise<void> {
@@ -1197,6 +1397,25 @@ async function bootstrap(): Promise<void> {
   applyBranding(settingsStore.get());
   dataStore = new DataStore(() => settingsStore.get().dataDirectory);
   await dataStore.load();
+  const activityRules = new ActivityRuleStore(() => settingsStore.get().dataDirectory);
+  await activityRules.load();
+  activityClassifier = new ActivityClassifier(settingsStore, dataStore, activityRules, (resolved) => {
+    if (runtime.activity.foregroundProcess !== resolved.foregroundProcess) return;
+    runtime.activity = {
+      ...runtime.activity,
+      activityKind: resolved.activityKind,
+      activityLabel: resolved.activityLabel,
+      applicationLabel: resolved.applicationLabel,
+      classificationSource: resolved.classificationSource,
+      classificationConfidence: resolved.classificationConfidence,
+      presenceState: resolved.presenceState
+    };
+    broadcastRuntimeStatus();
+    petWindow?.webContents.send("pet:activity", runtime.activity);
+    consoleWindow?.webContents.send("pet:activity", runtime.activity);
+    chatWindow?.webContents.send("pet:activity", runtime.activity);
+  });
+  await activityClassifier.initialize();
   await syncUninstallDataPath(settingsStore.get().dataDirectory);
   sensor = new SensorService();
   agentTools = new AgentTools({
@@ -1205,11 +1424,12 @@ async function bootstrap(): Promise<void> {
     getPetName: () => settingsStore.get().petName,
     getToolPermission: (name) => {
       const permissions = settingsStore.get().ai.toolPermissions;
-      if (name === "open_url" || name === "read_current_context") return permissions[name];
+      if (name === "open_url" || name === "launch_app" || name === "read_current_context") return permissions[name];
       return "ask";
     },
     setAction: (action) => { if (!actionIds.has(action) && !isDirectionalDragAction(action)) return false; sendPetAction(action); return true; },
-    openConsole
+    openConsole,
+    showNotification: (title, body) => void showAppNotification({ title, body, kind: "assistant" })
   });
   agent = new DeepSeekAgent(settingsStore, dataStore, () => runtime.activity, agentTools);
   updateService = new UpdateService({
@@ -1230,7 +1450,7 @@ async function bootstrap(): Promise<void> {
   lastProactiveAt = Date.now();
   sensor.on("snapshot", (snapshot) => {
     const settings = settingsStore.get();
-    const filtered = filterActivity(snapshot, settings);
+    const filtered = activityClassifier.classify(filterActivity(snapshot, settings));
     runtime.activity = filtered;
     runtime.sensorHealthy = snapshot.sensorSource !== "fallback";
     const sensingActive = settings.firstRunConsent && settings.sensing.enabled && (!runtime.sensingPausedUntil || runtime.sensingPausedUntil <= Date.now());
@@ -1240,7 +1460,7 @@ async function bootstrap(): Promise<void> {
       && !(settings.reminders.meetingSilent && filtered.meeting)
       && !(settings.reminders.fullscreenSilent && filtered.fullscreen);
     for (const reminder of reminderScheduler.tick(filtered, settings, interruptionsAllowed)) {
-      new Notification({ title: `${settings.petName} · ${reminder.title}`, body: reminder.body }).show();
+      void showAppNotification({ title: `${settings.petName} · ${reminder.title}`, body: reminder.body, kind: "reminder" });
       dataStore.increment(reminder.kind);
     }
     if (settings.manualMode === "energy_saving" && filtered.timestamp - lastEnergySnapshotAt < 4_000) return;
@@ -1249,7 +1469,7 @@ async function bootstrap(): Promise<void> {
     consoleWindow?.webContents.send("pet:activity", filtered);
     chatWindow?.webContents.send("pet:activity", filtered);
   });
-  sensor.start();
+  syncSensorForSettings(settingsStore.get());
   if (!smokeMode && !settingsStore.get().firstRunConsent) void openConsole("home");
   if (smokeMode) {
     try {

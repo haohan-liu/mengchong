@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { ActivitySnapshot, AgentToolCall, ChatChunk, PetSpeechEvent, PetSpeechKind, UpdateStatus } from "../src/types.js";
+import type { ActivitySnapshot, AgentToolCall, AppNotification, ChatChunk, PetSpeechEvent, PetSpeechKind, UpdateStatus } from "../src/types.js";
 
 const on = <T,>(channel: string, listener: (value: T) => void): (() => void) => {
   const handler = (_event: Electron.IpcRendererEvent, value: T) => listener(value);
@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld("petAPI", {
     openConsole: () => ipcRenderer.invoke("console:open"),
     openChat: () => ipcRenderer.invoke("chat:open"),
     hide: () => ipcRenderer.invoke("pet:hide"),
+    quit: () => ipcRenderer.invoke("app:quit"),
     setAction: (action: string) => ipcRenderer.invoke("pet:set-action", action),
     setState: (state: string) => ipcRenderer.invoke("pet:set-state", state),
     getRuntime: () => ipcRenderer.invoke("pet:runtime"),
@@ -21,12 +22,14 @@ contextBridge.exposeInMainWorld("petAPI", {
     resumeSensing: () => ipcRenderer.invoke("pet:resume-sensing"),
     nextSpeech: (kind: PetSpeechKind) => ipcRenderer.invoke("pet:next-speech", kind),
     previewScale: (scale: number, bubbleScale: number) => ipcRenderer.send("pet:preview-scale", { scale, bubbleScale }),
+    acknowledgeVisibility: (visible: boolean) => ipcRenderer.invoke("pet:visibility-ack", visible),
     onRuntimeChanged: (listener: (status: unknown) => void) => on("pet:runtime-changed", listener),
     onActivity: (listener: (snapshot: ActivitySnapshot) => void) => on("pet:activity", listener),
     onAction: (listener: (action: string) => void) => on("pet:action", listener),
     onSpeech: (listener: (speech: PetSpeechEvent) => void) => on("pet:speech", listener),
     onScalePreview: (listener: (value: { scale: number; bubbleScale: number }) => void) => on("pet:scale-preview", listener),
     onScaleFrame: (listener: (value: { scale: number }) => void) => on("pet:scale-frame", listener),
+    onVisibilityChanged: (listener: (visible: boolean) => void) => on("pet:visibility-changed", listener),
     notifyAnimationEnd: (action: string) => ipcRenderer.send("pet:animation-end", action)
   },
   console: {
@@ -51,9 +54,16 @@ contextBridge.exposeInMainWorld("petAPI", {
     get: (days: number) => ipcRenderer.invoke("statistics:get", days),
     clear: () => ipcRenderer.invoke("statistics:clear")
   },
+  activityRules: {
+    list: () => ipcRenderer.invoke("activity-rules:list"),
+    update: (id: string, changes: unknown) => ipcRenderer.invoke("activity-rules:update", id, changes),
+    delete: (id: string) => ipcRenderer.invoke("activity-rules:delete", id),
+    clear: () => ipcRenderer.invoke("activity-rules:clear")
+  },
   storage: {
     clearChats: () => ipcRenderer.invoke("storage:clear-chats"),
-    resetAll: () => ipcRenderer.invoke("storage:reset-all")
+    resetAll: () => ipcRenderer.invoke("storage:reset-all"),
+    clearAll: () => ipcRenderer.invoke("storage:clear-all")
   },
   updates: {
     status: () => ipcRenderer.invoke("updates:status"),
@@ -62,6 +72,16 @@ contextBridge.exposeInMainWorld("petAPI", {
     install: () => ipcRenderer.invoke("updates:install"),
     openReleases: () => ipcRenderer.invoke("updates:open-releases"),
     onChanged: (listener: (status: UpdateStatus) => void) => on("updates:changed", listener)
+  },
+  updatePopup: {
+    close: () => ipcRenderer.invoke("update-popup:close")
+  },
+  notificationPopup: {
+    current: () => ipcRenderer.invoke("notification-popup:current") as Promise<AppNotification>,
+    close: () => ipcRenderer.invoke("notification-popup:close"),
+    openReminders: () => ipcRenderer.invoke("notification-popup:open-reminders"),
+    openChat: () => ipcRenderer.invoke("notification-popup:open-chat"),
+    onChanged: (listener: (notification: AppNotification) => void) => on("notification-popup:changed", listener)
   },
   chat: {
     open: () => ipcRenderer.invoke("chat:open"),
@@ -74,12 +94,14 @@ contextBridge.exposeInMainWorld("petAPI", {
     rename: (sessionId: string, title: string) => ipcRenderer.invoke("chat:rename", sessionId, title),
     delete: (sessionId: string) => ipcRenderer.invoke("chat:delete", sessionId),
     status: () => ipcRenderer.invoke("chat:status"),
+    suggestions: () => ipcRenderer.invoke("chat:suggestions"),
     contextPreview: () => ipcRenderer.invoke("chat:context-preview"),
     syncTitle: (name: string) => ipcRenderer.invoke("window:sync-title", "chat", name),
     onChunk: (listener: (chunk: ChatChunk) => void) => on("chat:chunk", listener)
   },
   agentApproval: {
-    resolve: (id: string, approved: boolean) => ipcRenderer.invoke("agent:approval", id, approved),
+    resolve: (id: string, approved: boolean, allowConversation = false, conversationId = "") => ipcRenderer.invoke("agent:approval", id, approved, allowConversation, conversationId),
+    clear: () => ipcRenderer.invoke("agent:approval:clear"),
     onRequest: (listener: (call: AgentToolCall) => void) => on("agent:approval-request", listener)
   }
 });

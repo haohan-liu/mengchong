@@ -13,7 +13,9 @@ export default defineConfig({
       input: {
         pet: resolve(projectRoot, "index.html"),
         console: resolve(projectRoot, "console.html"),
-        chat: resolve(projectRoot, "chat.html")
+        chat: resolve(projectRoot, "chat.html"),
+        update: resolve(projectRoot, "update.html"),
+        notification: resolve(projectRoot, "notification.html")
       }
     }
   }

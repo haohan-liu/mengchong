@@ -15,7 +15,9 @@ const localDay = (): string => {
 
 const snapshot = (timestamp: number, keyboard = 0, clicks = 0, wheel = 0): ActivitySnapshot => ({
   timestamp, foregroundProcess: "Code.exe", foregroundPath: "", windowTitle: "", documentTitle: "",
-  appCategory: "development", activeAppSeconds: 65, appSwitches5m: 0,
+  activityKind: "developing", activityLabel: "开发中", applicationLabel: "VS Code",
+  classificationSource: "builtin", classificationConfidence: .96, presenceState: "active",
+  activeAppSeconds: 65, appSwitches5m: 0,
   keyboardCount1s: keyboard, keyboardCount10s: keyboard, keyboardPulse: keyboard > 0,
   mouseClicks1s: clicks, mouseClicks10s: clicks, mouseClickPulse: clicks > 0,
   mouseWheel1s: wheel, mouseWheel10s: wheel, mouseDistance1s: 0, mouseDistance10s: 0,
@@ -37,8 +39,10 @@ describe("statistics aggregation", () => {
     expect(summary.days).toHaveLength(7);
     expect(summary.today.inputEvents).toBe(7);
     expect(summary.today.activeSeconds).toBe(1);
+    expect(summary.today.restSeconds).toBe(0);
+    expect(summary.today.productiveSeconds).toBe(1);
     const persisted = JSON.parse(await readFile(join(root, "statistics.json"), "utf8"));
-    expect(persisted.version).toBe(3);
+    expect(persisted.version).toBe(4);
   });
 
   it("repairs legacy rolling-window input totals once", async () => {
@@ -56,10 +60,22 @@ describe("statistics aggregation", () => {
     const store = new DataStore(() => root);
     await store.load();
     const now = Date.now();
-    const figma = { ...snapshot(now - 1000), foregroundProcess: "msedge.exe", windowTitle: "Dashboard – Figma" };
+    const figma = { ...snapshot(now - 1000), foregroundProcess: "msedge.exe", windowTitle: "Dashboard – Figma", activityKind: "designing" as const, activityLabel: "设计中", applicationLabel: "Edge" };
     store.recordActivity(figma);
     store.recordActivity({ ...figma, timestamp: now });
-    expect(store.getStatistics(1).today.categories.design).toBe(1);
+    expect(store.getStatistics(1).today.categories.designing).toBe(1);
+  });
+
+  it("records locked or idle time as rest without counting it as active work", async () => {
+    const root = await mkdtemp(join(tmpdir(), "qpet-stats-rest-")); paths.push(root);
+    const store = new DataStore(() => root);
+    await store.load();
+    const now = Date.now();
+    store.recordActivity({ ...snapshot(now - 1_000), presenceState: "resting" });
+    store.recordActivity({ ...snapshot(now), presenceState: "resting" });
+    const today = store.getStatistics(1).today;
+    expect(today.restSeconds).toBe(1);
+    expect(today.activeSeconds).toBe(0);
   });
 
   it("counts the AI quota by calendar month", async () => {
@@ -68,7 +84,24 @@ describe("statistics aggregation", () => {
     await store.load();
     store.increment("aiCalls");
     expect(store.getCurrentMonthAiCalls()).toBe(1);
+    await store.clearStatistics();
+    expect(store.getCurrentMonthAiCalls()).toBe(1);
     await store.flush();
+  });
+
+  it("backfills an unknown segment even if AI resolves after the user goes away", async () => {
+    const root = await mkdtemp(join(tmpdir(), "qpet-stats-backfill-")); paths.push(root);
+    const store = new DataStore(() => root);
+    await store.load();
+    const now = Date.now();
+    const pending = { ...snapshot(now - 2_000), activityKind: "other" as const, activityLabel: "其他", classificationSource: "fallback" as const, classificationConfidence: -1 };
+    store.recordActivity(pending);
+    store.recordActivity({ ...pending, timestamp: now - 1_000 });
+    store.recordActivity({ ...snapshot(now), presenceState: "away" });
+    const today = store.getStatistics(1).today;
+    expect(today.activeSeconds).toBe(1);
+    expect(today.categories.developing).toBe(1);
+    expect(today.productiveSeconds).toBe(1);
   });
 
   it("persists the daily proactive speech limit", async () => {
