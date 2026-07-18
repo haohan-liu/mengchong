@@ -11,6 +11,18 @@ export interface AnimationDefinition {
   returnTo: string | null;
 }
 
+export type DragDirection = "left" | "right";
+export const directionalDragActions = ["dragged_left", "dragged_right"] as const;
+export type DirectionalDragAction = typeof directionalDragActions[number];
+
+export function directionalDragAction(direction: DragDirection): DirectionalDragAction {
+  return direction === "left" ? "dragged_left" : "dragged_right";
+}
+
+export function isDirectionalDragAction(action: string): action is DirectionalDragAction {
+  return (directionalDragActions as readonly string[]).includes(action);
+}
+
 export type PetState =
   | "BOOT" | "APPEAR" | "IDLE" | "LISTENING" | "USER_TYPING"
   | "THINKING" | "RESPONDING" | "SUCCESS" | "ERROR" | "OFFLINE"

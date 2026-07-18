@@ -32,6 +32,12 @@ describe("one-click publish assistant contract", () => {
     expect(script).toContain("源码提交说明");
     expect(script).toContain("GitHub Release 更新说明");
     expect(script).toContain("© 2026 浩涵");
+    expect(script).toContain("$RequiredSourceFiles = @(");
+    expect(script).toContain('"一键备份与发布.bat"');
+    expect(script).toContain('"一键安装开发环境.bat"');
+    expect(script).toContain("function Stage-SourceFiles");
+    expect(script).toContain('Invoke-Native "git" @("add", "--all")');
+    expect(script).toContain('Invoke-Native "git" @("add", "--", $requiredFile)');
     expect(launcher).toContain("scripts\\publish-assistant.ps1");
     expect(setupLauncher).toContain("scripts\\setup-dev-environment.ps1");
     expect(launcher).toContain("\r\n");

@@ -9,7 +9,7 @@ const on = <T,>(channel: string, listener: (value: T) => void): (() => void) => 
 
 contextBridge.exposeInMainWorld("petAPI", {
   pet: {
-    startDrag: () => ipcRenderer.invoke("pet:start-drag"),
+    startDrag: (origin: { x: number; y: number }, point: { x: number; y: number }) => ipcRenderer.invoke("pet:start-drag", { origin, point }),
     stopDrag: () => ipcRenderer.invoke("pet:stop-drag"),
     openConsole: () => ipcRenderer.invoke("console:open"),
     openChat: () => ipcRenderer.invoke("chat:open"),
@@ -44,6 +44,7 @@ contextBridge.exposeInMainWorld("petAPI", {
     resetPosition: () => ipcRenderer.invoke("settings:reset-position"),
     setApiKey: (value: string) => ipcRenderer.invoke("settings:set-api-key", value),
     hasApiKey: () => ipcRenderer.invoke("settings:has-api-key"),
+    openDeepSeekApiSignup: () => ipcRenderer.invoke("settings:open-deepseek-api-signup"),
     testDeepSeek: () => ipcRenderer.invoke("settings:test-ai")
   },
   statistics: {

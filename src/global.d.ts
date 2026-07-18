@@ -4,7 +4,7 @@ declare global {
   interface Window {
     petAPI: {
       pet: {
-        startDrag(): Promise<boolean>;
+        startDrag(origin: { x: number; y: number }, point: { x: number; y: number }): Promise<boolean>;
         stopDrag(): Promise<void>;
         openConsole(): Promise<void>;
         openChat(): Promise<void>;
@@ -33,6 +33,7 @@ declare global {
         resetPosition(): Promise<void>;
         setApiKey(value: string): Promise<boolean>;
         hasApiKey(): Promise<boolean>;
+        openDeepSeekApiSignup(): Promise<void>;
         testDeepSeek(): Promise<string>;
       };
       statistics: {

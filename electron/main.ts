@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 import type { ActivitySnapshot, PetRuntimeStatus, PetSpeechKind, PetState, Settings, UpdateStatus } from "../src/types.js";
+import { isDirectionalDragAction } from "../src/types.js";
+import { DRAG_RELEASE_SAMPLE_WINDOW_MS, dragGlideForRelease, type TimedDragPoint } from "../src/drag-motion.js";
 import { defaultSettings, SettingsStore } from "./services/SettingsStore.js";
 import { DataStore } from "./services/DataStore.js";
 import { SensorService } from "./services/SensorService.js";
@@ -14,6 +16,7 @@ import { UpdateService } from "./services/UpdateService.js";
 
 const APP_STATES = new Set<PetState>(["BOOT", "APPEAR", "IDLE", "LISTENING", "USER_TYPING", "THINKING", "RESPONDING", "SUCCESS", "ERROR", "OFFLINE", "LOW_BATTERY", "SLEEP", "DRAGGING", "REACTION", "DISAPPEAR"]);
 const RELEASES_URL = "https://github.com/haohan-liu/mengchong-exe/releases";
+const DEEPSEEK_API_SIGNUP_URL = "https://platform.deepseek.com/api_keys";
 const STATE_ACTIONS: Record<PetState, string[]> = {
   BOOT: ["idle_breath"], APPEAR: ["wave_hello"], IDLE: ["idle_breath", "idle_blink", "idle_look_around"], LISTENING: ["listen"],
   USER_TYPING: ["user_typing", "type_fast"], THINKING: ["thinking", "loading"], RESPONDING: ["talk_normal"], SUCCESS: ["success"],
@@ -24,6 +27,10 @@ const smokeMode = process.argv.includes("--smoke-test");
 // 只有由 Windows 登录项启动时才应用“启动延迟”；用户手动打开应用不需要等待。
 // 该参数由 SettingsStore 中的 Windows 自启动登记统一写入。
 const launchedAtLogin = process.argv.includes("--autostart");
+const PET_TOPMOST_LEVEL = "screen-saver" as const;
+const PET_TOPMOST_RELATIVE_LEVEL = 1;
+const DRAG_TRACKING_INTERVAL_MS = 8;
+const DRAG_GLIDE_FRAME_INTERVAL_MS = 8;
 if (smokeMode) {
   // CI/无完整显卡运行库的环境可能无法启动 Chromium GPU 子进程；烟雾测试使用软件渲染即可验证界面与 IPC。
   app.disableHardwareAcceleration();
@@ -44,13 +51,21 @@ let agent: DeepSeekAgent;
 let agentTools: AgentTools;
 let updateService: UpdateService;
 const reminderScheduler = new ReminderScheduler();
-let draggingTimer: NodeJS.Timeout | null = null;
+interface ScreenPoint { x: number; y: number; }
+interface DragSession {
+  offset: ScreenPoint;
+  lastPoint: ScreenPoint;
+  lastPosition: ScreenPoint;
+  samples: TimedDragPoint[];
+}
+let dragSession: DragSession | null = null;
+let dragTrackingTimer: NodeJS.Timeout | null = null;
+let dragMomentumTimer: NodeJS.Timeout | null = null;
 let manualStateTimer: NodeJS.Timeout | null = null;
 let sensingPauseTimer: NodeJS.Timeout | null = null;
 let lastEnergySnapshotAt = 0;
 let lastProactiveAt = 0;
 let proactivePending = false;
-let dragOffset = { x: 0, y: 0 };
 let writesPaused = false;
 let flushingQuit = false;
 let petVisibilityTarget = true;
@@ -118,6 +133,110 @@ function clampPetToWorkArea(): void {
   if (x !== bounds.x || y !== bounds.y) petWindow.setPosition(x, y, false);
 }
 
+function applyPetTopmost(settings: Settings): void {
+  const window = petWindow;
+  if (!window || window.isDestroyed()) return;
+  if (!settings.appearance.alwaysOnTop) {
+    window.setAlwaysOnTop(false);
+    return;
+  }
+  // "floating" can sit below another app's higher native level during login
+  // startup. The screen-saver level stays above ordinary application windows;
+  // the small relative level keeps us deterministic among same-level windows.
+  window.setAlwaysOnTop(true, PET_TOPMOST_LEVEL, PET_TOPMOST_RELATIVE_LEVEL);
+  if (window.isVisible()) window.moveTop();
+}
+
+function reassertPetTopmost(): void {
+  if (!petWindow || petWindow.isDestroyed()) return;
+  applyPetTopmost(settingsStore.get());
+}
+
+function isScreenPoint(value: unknown): value is ScreenPoint {
+  if (!value || typeof value !== "object") return false;
+  const point = value as Partial<ScreenPoint>;
+  return Number.isFinite(point.x) && Number.isFinite(point.y);
+}
+
+function clampPetPosition(position: ScreenPoint, referencePoint: ScreenPoint): ScreenPoint {
+  if (!petWindow || petWindow.isDestroyed()) return position;
+  const bounds = petWindow.getBounds();
+  const area = screen.getDisplayNearestPoint(referencePoint).workArea;
+  const maxX = Math.max(area.x, area.x + area.width - bounds.width);
+  const maxY = Math.max(area.y, area.y + area.height - bounds.height);
+  return {
+    x: Math.round(Math.min(Math.max(position.x, area.x), maxX)),
+    y: Math.round(Math.min(Math.max(position.y, area.y), maxY))
+  };
+}
+
+function clearDragMomentum(): void {
+  if (dragMomentumTimer) clearTimeout(dragMomentumTimer);
+  dragMomentumTimer = null;
+}
+
+function clearDragTracking(): void {
+  if (dragTrackingTimer) clearTimeout(dragTrackingTimer);
+  dragTrackingTimer = null;
+}
+
+function updateDragSession(session: DragSession, point: ScreenPoint, now = Date.now()): void {
+  if (!petWindow || petWindow.isDestroyed()) return;
+  session.lastPoint = point;
+  session.samples.push({ point, at: now });
+  const cutoff = now - DRAG_RELEASE_SAMPLE_WINDOW_MS;
+  while (session.samples.length > 2 && session.samples[0]!.at < cutoff) session.samples.shift();
+  const position = clampPetPosition({ x: point.x - session.offset.x, y: point.y - session.offset.y }, point);
+  if (position.x === session.lastPosition.x && position.y === session.lastPosition.y) return;
+  session.lastPosition = position;
+  petWindow.setPosition(position.x, position.y, false);
+}
+
+function startDragTracking(session: DragSession): void {
+  clearDragTracking();
+  const track = () => {
+    dragTrackingTimer = null;
+    if (dragSession !== session || !petWindow || petWindow.isDestroyed()) return;
+    updateDragSession(session, screen.getCursorScreenPoint());
+    dragTrackingTimer = setTimeout(track, DRAG_TRACKING_INTERVAL_MS);
+  };
+  dragTrackingTimer = setTimeout(track, 0);
+}
+
+function finishDragWithInertia(session: DragSession): void {
+  const window = petWindow;
+  if (!window || window.isDestroyed()) return;
+  const glide = dragGlideForRelease(session.samples, Date.now());
+  if (!glide) {
+    clampPetToWorkArea();
+    return;
+  }
+  const start = window.getBounds();
+  const target = clampPetPosition({
+    x: start.x + glide.velocity.x / glide.speed * glide.distance,
+    y: start.y + glide.velocity.y / glide.speed * glide.distance
+  }, session.lastPoint);
+  const deltaX = target.x - start.x;
+  const deltaY = target.y - start.y;
+  if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) return;
+  const startedAt = Date.now();
+  const finalDecay = 1 - Math.exp(-glide.duration / glide.decayTime);
+  const move = () => {
+    if (!petWindow || petWindow.isDestroyed()) { dragMomentumTimer = null; return; }
+    const elapsed = Math.min(glide.duration, Date.now() - startedAt);
+    const progress = elapsed / glide.duration;
+    // Exponential velocity decay preserves the release direction and gives a
+    // continuous fast-to-slow tail instead of spending most travel in frame 1.
+    const eased = (1 - Math.exp(-elapsed / glide.decayTime)) / finalDecay;
+    petWindow.setPosition(Math.round(start.x + deltaX * eased), Math.round(start.y + deltaY * eased), false);
+    if (progress < 1) dragMomentumTimer = setTimeout(move, DRAG_GLIDE_FRAME_INTERVAL_MS);
+    else { dragMomentumTimer = null; clampPetToWorkArea(); }
+  };
+  // Arm the timer before moving the native window so its move event cannot
+  // mistake the first glide frame for an external move and clamp against it.
+  dragMomentumTimer = setTimeout(move, 0);
+}
+
 async function setPetVisibility(visible: boolean): Promise<void> {
   const window = petWindow;
   if (!window || window.isDestroyed()) return;
@@ -128,6 +247,7 @@ async function setPetVisibility(visible: boolean): Promise<void> {
   if (visible && !window.isVisible()) {
     window.setOpacity(0);
     window.showInactive();
+    reassertPetTopmost();
   }
   const from = window.getOpacity();
   const to = visible ? 1 : 0;
@@ -225,7 +345,7 @@ function animatePetScale(scale: number): void {
 
 function applyAppearance(settings: Settings): void {
   if (!petWindow || petWindow.isDestroyed()) return;
-  petWindow.setAlwaysOnTop(settings.appearance.alwaysOnTop, "floating");
+  applyPetTopmost(settings);
   animatePetScale(settings.appearance.scale);
 }
 
@@ -252,10 +372,19 @@ async function createPetWindow(): Promise<void> {
   const window = petWindow;
   reportRendererHealth(window, "pet");
   petWindow.setMenu(null);
-  petWindow.on("move", clampPetToWorkArea);
+  petWindow.on("move", () => {
+    // Drag and inertia already clamp their own target position. Re-clamping on
+    // every native move event was doing an extra synchronous bounds read per
+    // frame and visibly fought the drag at the screen edge.
+    if (!dragSession && !dragMomentumTimer) clampPetToWorkArea();
+  });
+  petWindow.on("show", reassertPetTopmost);
+  petWindow.on("restore", reassertPetTopmost);
+  petWindow.webContents.once("did-finish-load", reassertPetTopmost);
   petWindow.on("closed", () => {
-    if (draggingTimer) clearInterval(draggingTimer);
-    draggingTimer = null;
+    dragSession = null;
+    clearDragTracking();
+    clearDragMomentum();
     petWindow = null;
   });
   await loadRenderer(window, "index.html");
@@ -268,7 +397,13 @@ async function createPetWindow(): Promise<void> {
     }
     petVisibilityTarget = true;
     window.showInactive();
+    reassertPetTopmost();
     await animatePetEntrance(window);
+    reassertPetTopmost();
+    // Explorer and login-started applications can still finish their initial
+    // z-order work just after this window is shown. One delayed reassertion
+    // closes that startup race without a permanent polling timer.
+    setTimeout(reassertPetTopmost, 700);
   }
 }
 
@@ -333,16 +468,18 @@ function createTray(): void {
 }
 
 function buildTrayMenu(petName: string): Menu {
-  const energySaving = settingsStore.get().manualMode === "energy_saving";
+  const settings = settingsStore.get();
+  const energySaving = settings.manualMode === "energy_saving";
+  const sensingEnabled = settings.firstRunConsent && settings.sensing.enabled && !runtime.sensingPausedUntil;
   return Menu.buildFromTemplate([
-    { label: `打开${petName}控制台`, click: () => void openConsole() },
-    { label: `和${petName}聊天`, click: () => void openChat() },
-    { label: `让${petName}说句话`, click: () => void setPetVisibility(true).then(() => showPetSpeech("proactive")) },
-    { label: energySaving ? "退出节能模式" : "开启节能模式", type: "checkbox", checked: energySaving, click: () => void toggleEnergySaving() },
-    { label: "暂停感知 10 分钟", click: () => setSensingPausedUntil(Date.now() + 600_000) },
+    { label: "打开控制台", click: () => void openConsole() },
+    { label: "聊天", click: () => void openChat() },
+    { label: "说句话", click: () => void setPetVisibility(true).then(() => showPetSpeech("proactive")) },
     { type: "separator" },
-    { label: "显示桌宠", click: () => void setPetVisibility(true) },
-    { label: "隐藏桌宠", click: () => void setPetVisibility(false) },
+    { label: `节能：${energySaving ? "开" : "关"}`, click: () => void toggleEnergySaving() },
+    { label: `感知：${sensingEnabled ? "开" : "关"}`, click: () => void toggleTraySensing() },
+    { type: "separator" },
+    { label: petVisibilityTarget ? "隐藏桌宠" : "显示桌宠", click: () => void setPetVisibility(!petVisibilityTarget) },
     { label: "退出", click: () => app.quit() }
   ]);
 }
@@ -355,6 +492,25 @@ async function toggleEnergySaving(): Promise<void> {
   consoleWindow?.webContents.send("settings:changed", saved);
   chatWindow?.webContents.send("settings:changed", saved);
   applyManualMode(saved);
+  applyBranding(saved);
+}
+
+async function toggleTraySensing(): Promise<void> {
+  const settings = settingsStore.get();
+  const currentlyEnabled = settings.firstRunConsent && settings.sensing.enabled && !runtime.sensingPausedUntil;
+  if (currentlyEnabled) {
+    settings.sensing.enabled = false;
+  } else {
+    settings.firstRunConsent = true;
+    settings.sensing.enabled = true;
+    setSensingPausedUntil(null);
+  }
+  const saved = await settingsStore.save(settings);
+  runtime.activity = filterActivity(runtime.activity, saved);
+  broadcastRuntimeStatus();
+  petWindow?.webContents.send("settings:changed", saved);
+  consoleWindow?.webContents.send("settings:changed", saved);
+  chatWindow?.webContents.send("settings:changed", saved);
   applyBranding(saved);
 }
 
@@ -372,7 +528,7 @@ function syncWindowCaption(window: BrowserWindow, target: "console" | "chat"): v
 }
 
 function sendPetAction(action: string): void {
-  if (!actionIds.has(action)) return;
+  if (!actionIds.has(action) && !isDirectionalDragAction(action)) return;
   runtime.action = action;
   petWindow?.webContents.send("pet:action", action);
 }
@@ -409,6 +565,7 @@ function applyManualMode(settings: Settings): void {
     }
   }
   broadcastRuntimeStatus();
+  tray?.setContextMenu(buildTrayMenu(settingsStore.get().petName));
 }
 
 function broadcastRuntimeStatus(): void {
@@ -455,6 +612,7 @@ function setSensingPausedUntil(until: number | null): void {
     }, Math.max(1, runtime.sensingPausedUntil - Date.now() + 50));
   }
   broadcastRuntimeStatus();
+  tray?.setContextMenu(buildTrayMenu(settingsStore.get().petName));
 }
 
 function filterActivity(snapshot: ActivitySnapshot, settings: Settings): ActivitySnapshot {
@@ -692,7 +850,20 @@ async function runSmokeTest(): Promise<void> {
   const actionDeadline = Date.now() + 2_000;
   while (runtime.action !== "clicked" && Date.now() < actionDeadline) await new Promise((resolve) => setTimeout(resolve, 30));
   if (runtime.action !== "clicked") throw new Error("Console action preview did not reach the pet renderer");
-  const dragIpc = await petWindow.webContents.executeJavaScript(`window.petAPI.pet.startDrag().then(async value => { await window.petAPI.pet.stopDrag(); return value; })`, true) as boolean;
+  const directionalDragPreview = await consoleWindow.webContents.executeJavaScript(`(() => {
+    const action = document.querySelector('[data-action="dragged_left"]');
+    if (!(action instanceof HTMLButtonElement)) return false;
+    action.click();
+    return true;
+  })()`, true) as boolean;
+  if (!directionalDragPreview) throw new Error("Console directional drag preview was not found");
+  const directionDeadline = Date.now() + 2_000;
+  while (String(runtime.action) !== "dragged_left" && Date.now() < directionDeadline) await new Promise((resolve) => setTimeout(resolve, 30));
+  if (String(runtime.action) !== "dragged_left") throw new Error("Directional drag preview did not reach the pet renderer");
+  const dragIpc = await petWindow.webContents.executeJavaScript(`(() => {
+    const point = { x: window.screenX + innerWidth / 2, y: window.screenY + innerHeight / 2 };
+    return window.petAPI.pet.startDrag(point, point).then(async value => { await window.petAPI.pet.stopDrag(); return value; });
+  })()`, true) as boolean;
   if (!dragIpc) throw new Error("Pet drag IPC was rejected while position was unlocked");
   const energyModeDispatched = await consoleWindow.webContents.executeJavaScript(`(() => {
     const button = document.querySelector('[data-mode="energy_saving"]');
@@ -814,26 +985,40 @@ async function runSmokeTest(): Promise<void> {
 }
 
 function registerIpc(): void {
-  ipcMain.handle("pet:start-drag", (event) => {
+  ipcMain.handle("pet:start-drag", (event, payload: { origin?: ScreenPoint; point?: ScreenPoint }) => {
     if (!petWindow || settingsStore.get().appearance.lockPosition || event.sender !== petWindow.webContents) return false;
-    const cursor = screen.getCursorScreenPoint();
+    const origin = payload?.origin;
+    const point = payload?.point;
+    if (!isScreenPoint(origin) || !isScreenPoint(point)) return false;
+    clearDragMomentum();
+    clearDragTracking();
     const bounds = petWindow.getBounds();
-    dragOffset = { x: cursor.x - bounds.x, y: cursor.y - bounds.y };
+    const now = Date.now();
+    const position = clampPetPosition({ x: point.x - (origin.x - bounds.x), y: point.y - (origin.y - bounds.y) }, point);
+    dragSession = {
+      offset: { x: origin.x - bounds.x, y: origin.y - bounds.y },
+      lastPoint: point,
+      lastPosition: position,
+      samples: [{ point, at: now }]
+    };
+    petWindow.setPosition(position.x, position.y, false);
+    startDragTracking(dragSession);
     runtime.state = "DRAGGING";
-    if (draggingTimer) clearInterval(draggingTimer);
-    draggingTimer = setInterval(() => {
-      if (!petWindow) return;
-      const point = screen.getCursorScreenPoint();
-      petWindow.setPosition(point.x - dragOffset.x, point.y - dragOffset.y, false);
-    }, 16);
+    runtime.source = "pointer-drag";
+    broadcastRuntimeStatus();
     return true;
   });
-  ipcMain.handle("pet:stop-drag", () => {
-    if (draggingTimer) clearInterval(draggingTimer);
-    draggingTimer = null;
-    clampPetToWorkArea();
+  ipcMain.handle("pet:stop-drag", (event) => {
+    if (event.sender !== petWindow?.webContents || !dragSession) return;
+    const session = dragSession;
+    dragSession = null;
+    clearDragTracking();
     runtime.state = "REACTION";
-    sendPetAction("drop_landing");
+    runtime.source = "pointer-drag";
+    broadcastRuntimeStatus();
+    // The renderer owns drop_landing, so release cannot restart that action
+    // midway through. The window receives only this short easing tail.
+    finishDragWithInertia(session);
   });
   ipcMain.handle("pet:hide", () => setPetVisibility(false));
   ipcMain.handle("pet:runtime", () => structuredClone(runtime));
@@ -856,7 +1041,7 @@ function registerIpc(): void {
     consoleWindow?.webContents.send("pet:scale-preview", preview);
   });
   ipcMain.handle("pet:set-action", (event, action: string) => {
-    if (!actionIds.has(action)) return false;
+    if (!actionIds.has(action) && !isDirectionalDragAction(action)) return false;
     runtime.action = action;
     runtime.source = event.sender === petWindow?.webContents ? "pet-state-machine" : "console-preview";
     if (event.sender !== petWindow?.webContents) sendPetAction(action);
@@ -928,6 +1113,7 @@ function registerIpc(): void {
     return saved;
   });
   ipcMain.handle("settings:has-api-key", () => settingsStore.hasApiKey());
+  ipcMain.handle("settings:open-deepseek-api-signup", () => shell.openExternal(DEEPSEEK_API_SIGNUP_URL));
   ipcMain.handle("settings:test-ai", () => agent.test());
   ipcMain.handle("window:sync-title", (event, target: string, rawName: string) => {
     const name = Array.from(String(rawName).replace(/[\u0000-\u001f\u007f]/g, "").trim()).slice(0, 12).join("") || settingsStore.get().petName;
@@ -1022,7 +1208,7 @@ async function bootstrap(): Promise<void> {
       if (name === "open_url" || name === "read_current_context") return permissions[name];
       return "ask";
     },
-    setAction: (action) => { if (!actionIds.has(action)) return false; sendPetAction(action); return true; },
+    setAction: (action) => { if (!actionIds.has(action) && !isDirectionalDragAction(action)) return false; sendPetAction(action); return true; },
     openConsole
   });
   agent = new DeepSeekAgent(settingsStore, dataStore, () => runtime.activity, agentTools);

@@ -1,8 +1,8 @@
 import animations from "../data/animations.json";
-import type { ActivitySnapshot, AnimationDefinition, PetSpeechEvent, PetSpeechKind, PetState, Settings } from "../types";
+import { directionalDragAction, isDirectionalDragAction, type ActivitySnapshot, type AnimationDefinition, type DragDirection, type PetSpeechEvent, type PetSpeechKind, type PetState, type Settings } from "../types";
 import { Animator } from "./animation/Animator";
 import { StateMachine } from "./state/StateMachine";
-import { ClickTracker, linkedBubbleScale, passedDragThreshold, stepPetScale } from "./interaction";
+import { ClickTracker, DragDirectionTracker, dragDirectionForMove, linkedBubbleScale, passedDragThreshold, stepPetScale } from "./interaction";
 
 export class PetApp {
   private animator!: Animator;
@@ -13,8 +13,12 @@ export class PetApp {
   private bubbleText!: HTMLDivElement;
   private clickTracker = new ClickTracker();
   private pointerStart: { x: number; y: number } | null = null;
+  private activePointerId: number | null = null;
+  private dragGesture = 0;
   private dragging = false;
   private dragStarting = false;
+  private dragDirection: DragDirection = "right";
+  private dragDirectionTracker = new DragDirectionTracker("right", 12);
   private suppressClick = false;
   private speechRequest = 0;
   private queuedSpeech: PetSpeechEvent | null = null;
@@ -45,7 +49,12 @@ export class PetApp {
     this.animator.setIntensity(this.effectiveIntensity());
     this.animator.setEnergySaving(this.settings.manualMode === "energy_saving");
     const map = new Map((animations as AnimationDefinition[]).map((item) => [item.id, item]));
-    this.machine = new StateMachine(map, (definition) => void this.animator.play(definition));
+    this.machine = new StateMachine(map, (definition) => {
+      // Only the dragged sprite has a mirrored left-facing variant. Every
+      // normal state returns to the authored, non-mirrored orientation.
+      if (definition.id !== "dragged") this.animator.setHorizontalFlip(false);
+      void this.animator.play(definition);
+    });
     this.animator.setCompleteListener((action) => this.machine.animationCompleted(action));
     this.bind();
     this.machine.transition("APPEAR", "wave_hello", true);
@@ -71,32 +80,38 @@ export class PetApp {
   private bind(): void {
     const hit = this.root.querySelector<HTMLButtonElement>(".pet-hit")!;
     hit.addEventListener("pointerdown", (event) => {
+      if (!event.isPrimary || event.button !== 0) return;
       this.pointerStart = { x: event.screenX, y: event.screenY };
+      this.activePointerId = event.pointerId;
+      this.dragDirectionTracker.reset(event.screenX, this.dragDirection);
+      this.dragGesture += 1;
       this.dragging = false;
       this.suppressClick = false;
       hit.setPointerCapture(event.pointerId);
     });
-    hit.addEventListener("pointermove", async (event) => {
-      if (this.pointerStart && !this.dragging && !this.dragStarting && passedDragThreshold(this.pointerStart, { x: event.screenX, y: event.screenY }, 12)) {
-        this.dragStarting = true;
-        const started = await window.petAPI.pet.startDrag();
-        this.dragStarting = false;
-        if (started && this.pointerStart) {
-          this.dragging = true;
+    hit.addEventListener("pointermove", (event) => {
+      const point = { x: event.screenX, y: event.screenY };
+      if (this.pointerStart && this.activePointerId === event.pointerId) {
+        if (!this.dragging && !this.dragStarting && passedDragThreshold(this.pointerStart, point, 8)) {
+          // A threshold-crossing pointer gesture is never a click, including
+          // the short interval while the native drag IPC is being accepted.
           this.suppressClick = true;
-          hit.classList.add("dragging");
-          this.machine.transition("DRAGGING", "dragged", true);
-        } else if (started) {
-          await window.petAPI.pet.stopDrag();
+          void this.beginDrag(hit, event.pointerId, this.dragGesture, point);
         }
+        if (this.dragging) this.updateDragDirection(point);
+        return;
       }
       const now = performance.now();
       const speed = Math.hypot(event.screenX - this.lastPointer.x, event.screenY - this.lastPointer.y) / Math.max(1, now - this.lastPointer.at);
       this.lastPointer = { x: event.screenX, y: event.screenY, at: now };
-      if (!this.pointerStart && speed > 1.4 && this.machine.currentState === "IDLE") this.machine.reaction("follow_cursor");
+      if (speed > 1.4 && this.machine.currentState === "IDLE") this.machine.reaction("follow_cursor");
     });
-    const finishPointer = () => {
+    const finishPointer = (event: PointerEvent) => {
+      if (this.activePointerId !== event.pointerId) return;
       this.pointerStart = null;
+      this.activePointerId = null;
+      this.dragGesture += 1;
+      if (hit.hasPointerCapture(event.pointerId)) hit.releasePointerCapture(event.pointerId);
       if (this.dragging) {
         this.dragging = false;
         hit.classList.remove("dragging");
@@ -144,6 +159,10 @@ export class PetApp {
     window.addEventListener("blur", () => { const menu = this.root.querySelector<HTMLElement>(".pet-context"); if (menu) menu.hidden = true; });
     this.unlisten.push(window.petAPI.pet.onActivity((snapshot) => this.handleActivity(snapshot)));
     this.unlisten.push(window.petAPI.pet.onAction((action) => {
+      if (isDirectionalDragAction(action)) {
+        this.playDirectionalDrag(action === "dragged_left" ? "left" : "right");
+        return;
+      }
       this.machine.transition(action === "dragged" ? "DRAGGING" : "REACTION", action, true);
     }));
     this.unlisten.push(window.petAPI.pet.onSpeech((speech) => {
@@ -173,6 +192,54 @@ export class PetApp {
       const approved = window.confirm(`${this.petName()}想执行：${call.name}\n\n${detail}\n\n是否允许本次操作？`);
       void window.petAPI.agentApproval.resolve(call.id, approved);
     }));
+  }
+
+  private async beginDrag(hit: HTMLElement, pointerId: number, gesture: number, point: { x: number; y: number }): Promise<void> {
+    const origin = this.pointerStart;
+    if (!origin) return;
+    this.dragStarting = true;
+    let started = false;
+    try {
+      started = await window.petAPI.pet.startDrag(origin, point);
+    } catch {
+      return;
+    } finally {
+      this.dragStarting = false;
+    }
+    if (!started) return;
+    if (this.activePointerId !== pointerId || this.dragGesture !== gesture || !this.pointerStart) {
+      void window.petAPI.pet.stopDrag();
+      return;
+    }
+    this.dragging = true;
+    this.suppressClick = true;
+    hit.classList.add("dragging");
+    const direction = dragDirectionForMove(origin, point, this.dragDirection);
+    this.dragDirectionTracker.reset(point.x, direction);
+    this.playDirectionalDrag(direction, true);
+  }
+
+  private updateDragDirection(point: { x: number; y: number }): void {
+    const direction = this.dragDirectionTracker.update(point.x);
+    if (direction === this.dragDirection) return;
+    this.playDirectionalDrag(direction);
+  }
+
+  private playDirectionalDrag(direction: DragDirection, forceStart = false): void {
+    const changed = direction !== this.dragDirection;
+    this.dragDirection = direction;
+    this.animator.setHorizontalFlip(direction === "left");
+    // Start the drag animation once. A turn keeps the current frame and only
+    // mirrors it; restarting the state machine here reset frame 0 and its fade
+    // on every reversal, which was the visible hitch during left/right turns.
+    if (forceStart || this.machine.currentState !== "DRAGGING" || this.machine.currentAction !== "dragged") {
+      this.machine.transition("DRAGGING", "dragged", true);
+    }
+    if (!changed && !forceStart) return;
+    // The frame asset stays shared, while the runtime action records which
+    // direction is displayed. This keeps the console and diagnostics honest
+    // without duplicating 12 PNG frames solely to mirror them.
+    void window.petAPI.pet.setAction(directionalDragAction(direction));
   }
 
   private handleActivity(snapshot: ActivitySnapshot): void {
@@ -323,14 +390,17 @@ export class PetApp {
     const configuredBubbleScale = Math.min(1.3, Math.max(.8, this.pendingBubbleScale ?? this.settings.appearance.bubbleScale));
     // During wheel/slider scaling, use the actual native-window frame rather
     // than the final target so the pet, bubble and status pill stay in sync.
-    const bubbleScale = this.pendingScale !== null ? linkedBubbleScale(scale) : configuredBubbleScale;
+    const requestedBubbleScale = this.pendingScale !== null ? linkedBubbleScale(scale) : configuredBubbleScale;
+    // At the smallest pet size, shrink the bubble slightly more than its
+    // configured scale so it has clear separation from the head and remains
+    // fully inside the native transparent window.
+    const bubbleScale = Math.min(requestedBubbleScale, Math.min(1, .5 + scale * .5));
     const statusScale = Math.min(1.16, Math.max(.86, .72 + scale * .28));
     const bubbleWidth = Math.min(268, Math.max(128, (360 * scale - 36) / bubbleScale));
-    const bubbleGap = Math.min(16, Math.max(8, 4 + scale * 7));
-    // A fixed 71.7% bottom offset pushes the scaled bubble above the native
-    // window when the pet is at its 60% minimum. Lower it progressively while
-    // keeping the original placement from normal size upward.
-    const bubbleBottomPercent = Math.min(71.7, 58.5 + scale * 13);
+    const bubbleGap = Math.min(17, Math.max(9, 4 + scale * 8));
+    // Keep the bubble above the character's head even at the 60% minimum
+    // size. The previous low-scale anchor could intersect the head.
+    const bubbleBottomPercent = Math.min(71.7, 63.5 + scale * 7.5);
     const bubbleFontSize = Math.min(22, Math.max(12, Number(this.settings.appearance.bubbleFontSize) || 15));
     document.documentElement.style.setProperty("--pet-scale", String(scale));
     document.documentElement.style.setProperty("--bubble-scale", String(bubbleScale));

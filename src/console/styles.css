@@ -742,6 +742,7 @@ textarea { min-height: 160px; resize: vertical; }
 .tour-api-note b { grid-row: 1 / span 2; align-self: center; border-radius: 8px; padding: 6px 8px; background: var(--accent); color: #fff; font-size: 9px; }
 .tour-api-note span { color: var(--text); font-size: 10px; font-weight: 700; }
 .tour-api-note small { color: var(--text-muted); font-size: 9px; }
+.tour-api-note .tour-api-link { grid-column: 2; justify-self: start; min-height: 27px; margin-top: 3px; padding: 0 9px; font-size: 9px; }
 .tour-card footer { display: flex; align-items: center; gap: 7px; margin-top: 18px; }
 .tour-action-group { display: flex; gap: 7px; margin-left: auto; }
 .tour-card button { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; border: 1px solid var(--border-strong); border-radius: 11px; padding: 0 13px; background: var(--surface-solid); color: var(--text); font-size: 10px; font-weight: 680; cursor: pointer; transition: .16s ease; }

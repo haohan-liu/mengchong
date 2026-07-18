@@ -49,7 +49,7 @@ export function defaultSettings(): Settings {
       quietEnd: "08:00",
       meetingSilent: true,
       fullscreenSilent: true,
-      autostart: false,
+      autostart: true,
       startupDelaySeconds: 3
     },
     ai: {

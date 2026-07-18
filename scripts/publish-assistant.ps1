@@ -31,6 +31,10 @@ $ReleaseTitlePrefix = "珊珊桌宠"
 $GitHubHost = "github.com"
 $ElectronMirror = "https://npmmirror.com/mirrors/electron/"
 $ElectronBuilderMirror = "https://npmmirror.com/mirrors/electron-builder-binaries/"
+$RequiredSourceFiles = @(
+  "一键备份与发布.bat",
+  "一键安装开发环境.bat"
+)
 # ============================================================================
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -264,6 +268,23 @@ function Push-SourceWithRetry {
   } finally { Pop-Location }
 }
 
+function Stage-SourceFiles {
+  foreach ($requiredFile in $RequiredSourceFiles) {
+    $requiredPath = Join-Path $ProjectRoot $requiredFile
+    if (-not (Test-Path $requiredPath -PathType Leaf)) {
+      throw "缺少必须随源码备份的启动文件：$requiredFile。请恢复该文件后重新运行。"
+    }
+  }
+
+  # --all 会纳入所有源码变更；随后再次显式暂存两个启动器，确保它们的更新
+  # 一定会随本次备份推送到源码仓库，从而替换远端的旧版本。
+  Invoke-Native "git" @("add", "--all") "整理待上传文件失败"
+  foreach ($requiredFile in $RequiredSourceFiles) {
+    Invoke-Native "git" @("add", "--", $requiredFile) "暂存启动文件 $requiredFile 失败"
+  }
+  Write-Ok "两个一键启动文件已纳入本次源码备份"
+}
+
 function Backup-Source([string]$DefaultMessage = "") {
   Ensure-GitHubReady
   Ensure-RemoteRepo $SourceRepoSlug $false "源码备份"
@@ -273,7 +294,7 @@ function Backup-Source([string]$DefaultMessage = "") {
 
   Push-Location $ProjectRoot
   try {
-    Invoke-Native "git" @("add", "--all") "整理待上传文件失败"
+    Stage-SourceFiles
     $changes = @(& git status --short)
     if ($changes.Count -gt 0) {
       Write-Host ""
@@ -443,8 +464,10 @@ function Resume-PendingRelease {
   }
   $assets = Assert-ReleaseAssets $version
   Write-Warn "待继续版本：v$version。不会重新改版本或重新打包。"
-  $confirm = Read-Host "检查安装包和说明后，输入“发布”或“确定”继续；其他输入退出"
-  if ($confirm.Trim() -notin @("发布", "确定")) { Write-Info "已保留待发布状态，下次仍可继续。"; return }
+  $confirm = Read-Host "检查安装包和说明后，输入“发布”、“确定”或 PUBLISH 继续；其他输入退出"
+  if ($confirm -cne "PUBLISH") {
+    if ($confirm.Trim() -notin @("发布", "确定")) { Write-Info "已保留待发布状态，下次仍可继续。"; return }
+  }
   Ensure-GitHubReady
   Ensure-RemoteRepo $ReleaseRepoSlug $true "公开安装包发布"
   Backup-Source "chore(release): prepare v$version"
@@ -475,8 +498,10 @@ function Publish-Release {
   Invoke-ReleaseBuild
   $assets = Assert-ReleaseAssets $version
   $notesPath = New-ReleaseNotes $version
-  $confirm = Read-Host "确认版本、说明和目标仓库无误后，输入“发布”或“确定”"
-  if ($confirm.Trim() -notin @("发布", "确定")) { throw "未确认发布。安装包仍保留在 release 文件夹，可稍后重试。" }
+  $confirm = Read-Host "确认版本、说明和目标仓库无误后，输入“发布”、“确定”或 PUBLISH"
+  if ($confirm -cne "PUBLISH") {
+    if ($confirm.Trim() -notin @("发布", "确定")) { throw "未确认发布。安装包仍保留在 release 文件夹，可稍后重试。" }
+  }
   New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
   @{ version = $version; notesPath = $notesPath } | ConvertTo-Json | Set-Content $PendingReleasePath -Encoding UTF8
   # 只有完整测试与打包通过、且用户明确确认发布后才提交源码。

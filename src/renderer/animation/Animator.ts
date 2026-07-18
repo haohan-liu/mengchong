@@ -18,6 +18,7 @@ export class Animator {
   private intensity: "full" | "soft" | "minimal" = "full";
   private energySaving = false;
   private resizeTimer = 0;
+  private horizontalFlip = false;
 
   constructor(private readonly canvas: HTMLCanvasElement) {
     this.context = canvas.getContext("2d", { alpha: true })!;
@@ -38,6 +39,12 @@ export class Animator {
     this.energySaving = value;
     this.transitionMs = value ? 0 : 80;
     this.resize();
+  }
+  setHorizontalFlip(value: boolean): void {
+    if (this.horizontalFlip === value) return;
+    this.horizontalFlip = value;
+    this.renderedIndex = -1;
+    this.renderedAlpha = -1;
   }
   setCompleteListener(listener: (action: string) => void): void { this.onComplete = listener; }
 
@@ -94,6 +101,10 @@ export class Animator {
     this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
     this.context.save();
     this.context.globalAlpha = alpha;
+    if (this.horizontalFlip) {
+      this.context.translate(this.canvas.width, 0);
+      this.context.scale(-1, 1);
+    }
     this.context.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
     this.context.restore();
     this.renderedIndex = this.index;
