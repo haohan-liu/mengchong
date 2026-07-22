@@ -67,6 +67,76 @@ function Invoke-Native([string]$FilePath, [string[]]$Arguments, [string]$Failure
   if ($LASTEXITCODE -ne 0) { throw "$FailureMessage（退出码：$LASTEXITCODE）" }
 }
 
+function ConvertTo-WindowsCommandLineArgument([string]$Value) {
+  if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+  $builder = [Text.StringBuilder]::new()
+  [void]$builder.Append('"')
+  $backslashes = 0
+  foreach ($character in $Value.ToCharArray()) {
+    if ($character -eq '\') {
+      $backslashes++
+    } elseif ($character -eq '"') {
+      if ($backslashes -gt 0) { [void]$builder.Append(('\' * ($backslashes * 2))) }
+      [void]$builder.Append('\"')
+      $backslashes = 0
+    } else {
+      if ($backslashes -gt 0) { [void]$builder.Append(('\' * $backslashes)) }
+      [void]$builder.Append($character)
+      $backslashes = 0
+    }
+  }
+  if ($backslashes -gt 0) { [void]$builder.Append(('\' * ($backslashes * 2))) }
+  [void]$builder.Append('"')
+  return $builder.ToString()
+}
+
+function Invoke-NativeWithHeartbeat(
+  [string]$FilePath,
+  [string[]]$Arguments,
+  [string]$FailureMessage,
+  [string]$Activity,
+  [long]$TotalBytes
+) {
+  $sizeText = if ($TotalBytes -gt 0) { "{0:N1} MiB" -f ($TotalBytes / 1MB) } else { "未知大小" }
+  Write-Info "$Activity，文件共 $sizeText。GitHub CLI 不提供可靠的实时百分比，下面显示活动条和已用时间。"
+  $process = $null
+  $exitCode = -1
+  $startedAt = Get-Date
+  $tick = 0
+  try {
+    $argumentLine = (($Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = $argumentLine
+    $startInfo.WorkingDirectory = $ProjectRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw "$Activity 无法启动上传进程。" }
+    while (-not $process.HasExited) {
+      $elapsed = (Get-Date) - $startedAt
+      $elapsedText = "{0:00}:{1:00}:{2:00}" -f [Math]::Floor($elapsed.TotalHours), $elapsed.Minutes, $elapsed.Seconds
+      $barWidth = 18
+      $position = $tick % $barWidth
+      $bar = ("·" * $position) + "■" + ("·" * ($barWidth - $position - 1))
+      Write-Host "`r[上传中] [$bar] 已用 $elapsedText | $sizeText | 进程仍在运行" -NoNewline -ForegroundColor Cyan
+      Start-Sleep -Milliseconds 500
+      $tick++
+      $process.Refresh()
+    }
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
+  } finally {
+    if ($process -and -not $process.HasExited) {
+      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host ""
+  }
+  if ($exitCode -ne 0) { throw "$FailureMessage（退出码：$exitCode）" }
+  Write-Ok "$Activity 完成"
+}
+
 # 某些探测命令（例如首次运行时检查 Git 仓库或 Release 是否存在）失败是正常分支，
 # 不能让 Windows PowerShell 的 Stop 策略把它们误判成整个助手崩溃。
 function Test-NativeProbe([scriptblock]$Operation) {
@@ -560,6 +630,33 @@ function Assert-RemoteReleaseAssets([object]$Release, [string[]]$Assets) {
   }
 }
 
+function Show-PostReleaseMenu([string]$Tag) {
+  Write-Title "本次发布已完成"
+  Write-Host "1. 打开本次版本的 Release 发布页"
+  Write-Host "2. 打开安装包发布仓库主页"
+  Write-Host "0. 完成本次发布并退出（直接回车也可以）"
+  while ($true) {
+    $choice = Read-Host "请输入序号"
+    switch ($choice.Trim()) {
+      { $_ -in @("1", "Y", "y") } {
+        & $script:GhPath release view $Tag --repo $ReleaseRepoSlug --web
+        Write-Ok "已打开本次 Release 发布页，本次流程结束。"
+        return
+      }
+      "2" {
+        & $script:GhPath repo view $ReleaseRepoSlug --web
+        Write-Ok "已打开安装包发布仓库，本次流程结束。"
+        return
+      }
+      { [string]::IsNullOrWhiteSpace($_) -or $_ -eq "0" } {
+        Write-Ok "本次发布流程已正常结束。"
+        return
+      }
+      default { Write-Warn "请输入 1、2、0，或直接按回车完成。" }
+    }
+  }
+}
+
 function Complete-ReleaseUpload([string]$Version, [string[]]$Assets, [string]$NotesPath) {
   $tag = "v$Version"
   Write-Title "发布到 GitHub Releases"
@@ -567,7 +664,7 @@ function Complete-ReleaseUpload([string]$Version, [string[]]$Assets, [string]$No
   Confirm-GitHubLoginBeforePublish
 
   Write-Info "正在检查目标版本是否已存在（最多等待 $GitHubProbeTimeoutSeconds 秒）…"
-  $releaseExists = Test-GitHubCliProbe @("release", "view", $tag, "--repo", $ReleaseRepoSlug, "--json", "url,assets") "GitHub Release 检查"
+  $releaseExists = Test-GitHubCliProbe @("release", "view", $tag, "--repo", $ReleaseRepoSlug, "--json", "url,assets,isDraft,tagName") "GitHub Release 检查"
   if (-not $releaseExists) {
     $arguments = @("release", "create", $tag) + $Assets + @(
       "--repo", $ReleaseRepoSlug,
@@ -576,7 +673,8 @@ function Complete-ReleaseUpload([string]$Version, [string[]]$Assets, [string]$No
       "--notes-file", $NotesPath,
       "--latest"
     )
-    Invoke-Native $script:GhPath $arguments "创建 GitHub Release 或上传文件失败"
+    $totalBytes = ($Assets | Get-Item | Measure-Object -Property Length -Sum).Sum
+    Invoke-NativeWithHeartbeat $script:GhPath $arguments "创建 GitHub Release 或上传文件失败" "正在创建 $tag 并上传更新文件" $totalBytes
   } else {
     $existingRelease = $script:LastGitHubProbeOutput | ConvertFrom-Json
     $remoteAssetNames = @($existingRelease.assets | ForEach-Object { $_.name })
@@ -585,22 +683,37 @@ function Complete-ReleaseUpload([string]$Version, [string[]]$Assets, [string]$No
       $missingNames = @($missingAssets | ForEach-Object { Split-Path $_ -Leaf })
       Write-Warn "$tag 已存在但发布未完整，将断点续传缺少的文件：$($missingNames -join '、')"
       $uploadArguments = @("release", "upload", $tag) + $missingAssets + @("--repo", $ReleaseRepoSlug)
-      Invoke-Native $script:GhPath $uploadArguments "补传 GitHub Release 文件失败"
+      $missingBytes = ($missingAssets | Get-Item | Measure-Object -Property Length -Sum).Sum
+      Invoke-NativeWithHeartbeat $script:GhPath $uploadArguments "补传 GitHub Release 文件失败" "正在为 $tag 补传缺失文件" $missingBytes
     } else {
       Write-Ok "$tag 已经存在，且三个更新文件均已上传；不会覆盖已有资产。"
     }
   }
 
-  if (-not (Test-GitHubCliProbe @("release", "view", $tag, "--repo", $ReleaseRepoSlug, "--json", "url,assets") "发布后远端校验" 30)) {
+  if (-not (Test-GitHubCliProbe @("release", "view", $tag, "--repo", $ReleaseRepoSlug, "--json", "url,assets,isDraft,tagName") "发布后远端校验" 30)) {
     throw "Release 已提交，但发布后校验失败，请到网页确认。$($script:LastGitHubProbeError)"
   }
   $release = $script:LastGitHubProbeOutput | ConvertFrom-Json
   Assert-RemoteReleaseAssets $release $Assets
+
+  Write-Title "确认正式发布状态"
+  if ($release.isDraft) {
+    Write-Warn "$tag 的文件已经完整，但目前仍是草稿；正在转为正式版本并设为 Latest。"
+    Invoke-Native $script:GhPath @("release", "edit", $tag, "--repo", $ReleaseRepoSlug, "--draft=false", "--latest") "草稿转正式版本失败"
+  } else {
+    Write-Info "$tag 已是正式版本，正在确认它被标记为 Latest。"
+    Invoke-Native $script:GhPath @("release", "edit", $tag, "--repo", $ReleaseRepoSlug, "--latest") "设置 Latest 版本失败"
+  }
+  if (-not (Test-GitHubCliProbe @("release", "view", $tag, "--repo", $ReleaseRepoSlug, "--json", "url,assets,isDraft,tagName") "正式发布状态复检" 30)) {
+    throw "文件已上传，但无法确认正式发布状态。$($script:LastGitHubProbeError)"
+  }
+  $release = $script:LastGitHubProbeOutput | ConvertFrom-Json
+  if ($release.isDraft) { throw "$tag 仍然是草稿，已停止清理待发布记录，请到发布页检查。" }
+  Assert-RemoteReleaseAssets $release $Assets
   if (Test-Path $PendingReleasePath) { Remove-Item -LiteralPath $PendingReleasePath -Force }
-  Write-Ok "发布完成且 3 个更新文件均已在远端确认"
+  Write-Ok "发布完成：已转为正式版本、设为 Latest，且 3 个更新文件均已确认"
   Write-Host "发布地址：$($release.url)" -ForegroundColor Green
-  $open = Read-Host "是否现在打开发布页？输入 Y 打开"
-  if ($open -match '^[Yy]$') { & $script:GhPath release view $tag --repo $ReleaseRepoSlug --web }
+  Show-PostReleaseMenu $tag
 }
 
 function Resume-PendingRelease {
