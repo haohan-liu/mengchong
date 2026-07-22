@@ -39,11 +39,14 @@ $RequiredSourceFiles = @(
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $SourceRepoUrl = "https://$GitHubHost/$SourceRepoSlug.git"
+$GitHubAccount = ($SourceRepoSlug -split '/')[0]
 $WorkDirectory = Join-Path $ProjectRoot ".publish"
 $PendingReleasePath = Join-Path $WorkDirectory "pending-release.json"
 $script:GhPath = $null
 $script:GitHubReady = $false
 $script:ReplaceRemoteMain = $false
+$script:LastGitHubProbeError = ""
+$GitHubProbeTimeoutSeconds = 30
 
 # 发布助手启动的 npm/electron-builder 子进程统一使用国内二进制镜像。
 $env:ELECTRON_MIRROR = $ElectronMirror
@@ -78,6 +81,40 @@ function Test-NativeProbe([scriptblock]$Operation) {
   }
 }
 
+# gh 的 repo/release 查询在代理失效、网络半通或凭据异常时可能长时间没有任何输出。
+# 这些命令都是“是否存在”的探测，不应让发布窗口无限等待；上传安装包仍使用正常 gh
+# 命令，以便保留上传进度和较长的合理等待时间。
+function Test-GitHubCliProbe([string[]]$Arguments, [string]$Description, [int]$TimeoutSeconds = $GitHubProbeTimeoutSeconds) {
+  $script:LastGitHubProbeError = ""
+  $startInfo = [Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $script:GhPath
+  $startInfo.Arguments = $Arguments -join ' '
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  $process = [Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  try {
+    if (-not $process.Start()) { throw "$Description 无法启动 GitHub CLI。" }
+    # 立即异步读取两个输出流，防止 Start-Process + 重定向在 Windows PowerShell 5.1
+    # 中互相等待，造成 API 明明可用但探测命令卡住。
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+      try { $process.Kill() } catch { }
+      [void]$process.WaitForExit(2000)
+      throw "$Description 在 $TimeoutSeconds 秒内没有收到 GitHub 响应。请检查 VPN/代理后重试；国内 npm/Electron 镜像不会影响 GitHub Release。"
+    }
+    $stdoutTask.Wait()
+    $stderrTask.Wait()
+    $script:LastGitHubProbeError = $stderrTask.Result.Trim()
+    return $process.ExitCode -eq 0
+  } finally {
+    $process.Dispose()
+  }
+}
+
 function Assert-Command([string]$Name, [string]$InstallHint) {
   if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
     throw "没有找到 $Name。$InstallHint"
@@ -109,7 +146,8 @@ function Resolve-GitHubCli {
 
 function Show-ProxyState {
   Write-Info "网络诊断只读取代理配置，不会自动修改你的 VPN 或系统代理。"
-  $gitProxy = (& git config --global --get http.proxy 2>$null)
+  $gitProxy = (& git config --global --get https.proxy 2>$null)
+  if (-not $gitProxy) { $gitProxy = (& git config --global --get http.proxy 2>$null) }
   if ($gitProxy) { Write-Warn "Git 全局代理已设置：$gitProxy" }
   if ($env:HTTPS_PROXY) { Write-Warn "HTTPS_PROXY 环境变量已设置。" }
   if ($env:HTTP_PROXY) { Write-Warn "HTTP_PROXY 环境变量已设置。" }
@@ -118,17 +156,67 @@ function Show-ProxyState {
   }
 }
 
+function Enable-GitHubCliProxy {
+  # Git 本身会读取 http(s).proxy，但 gh 不会读取 Git 配置。将已有 Git 代理仅复制到
+  # 当前脚本进程的 HTTP(S)_PROXY，确保源码推送和 GitHub 登录/Release 使用同一条线路。
+  if ($env:HTTPS_PROXY -or $env:HTTP_PROXY) {
+    Write-Info "GitHub CLI 将使用当前环境变量中的代理。"
+    return
+  }
+  $gitProxy = (& git config --global --get https.proxy 2>$null)
+  if (-not $gitProxy) { $gitProxy = (& git config --global --get http.proxy 2>$null) }
+  if ([string]::IsNullOrWhiteSpace($gitProxy)) { return }
+  if ($gitProxy -notmatch '^https?://') {
+    Write-Warn "Git 全局代理格式无法供 GitHub CLI 使用：$gitProxy"
+    return
+  }
+  $env:HTTPS_PROXY = $gitProxy.Trim()
+  $env:HTTP_PROXY = $gitProxy.Trim()
+  Write-Ok "GitHub CLI 已临时沿用 Git 全局代理；不会修改系统设置。"
+}
+
+function Test-TcpEndpoint([string]$HostName, [int]$Port, [int]$TimeoutMilliseconds = 8000) {
+  # Test-NetConnection 在某些代理/网络驱动下会无限显示“Waiting for response”。
+  # 这里使用异步 TCP 连接，并由脚本自己控制超时，确保发布助手能回到可操作的提示。
+  $client = [System.Net.Sockets.TcpClient]::new()
+  $connect = $null
+  try {
+    $connect = $client.BeginConnect($HostName, $Port, $null, $null)
+    if (-not $connect.AsyncWaitHandle.WaitOne($TimeoutMilliseconds, $false)) { return $false }
+    $client.EndConnect($connect)
+    return $true
+  } catch {
+    return $false
+  } finally {
+    if ($connect) { $connect.AsyncWaitHandle.Close() }
+    $client.Close()
+  }
+}
+
 function Wait-ForGitHubNetwork {
   Write-Title "检查 GitHub 网络"
   Show-ProxyState
-  while ($true) {
-    $reachable = $false
+  $testHost = $GitHubHost
+  $testPort = 443
+  $testLabel = "$GitHubHost`:443"
+  if ($env:HTTPS_PROXY) {
     try {
-      $reachable = Test-NetConnection $GitHubHost -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
-    } catch { $reachable = $false }
-    if ($reachable) { Write-Ok "已连通 $GitHubHost`:443"; return }
+      $proxyUri = [Uri]$env:HTTPS_PROXY
+      if ($proxyUri.Host) {
+        $testHost = $proxyUri.Host
+        $testPort = if ($proxyUri.IsDefaultPort) { if ($proxyUri.Scheme -eq 'https') { 443 } else { 80 } } else { $proxyUri.Port }
+        $testLabel = "本地 GitHub 代理 $testHost`:$testPort"
+      }
+    } catch {
+      Write-Warn "HTTPS_PROXY 地址无法解析，将改为检测 github.com。"
+    }
+  }
+  while ($true) {
+    Write-Info "正在连接 $testLabel（最多等待 8 秒）…"
+    $reachable = Test-TcpEndpoint $testHost $testPort 8000
+    if ($reachable) { Write-Ok "已连通 $testLabel"; return }
 
-    Write-Warn "当前无法连接 GitHub。可能是网络、VPN、代理或 DNS 导致。"
+    Write-Warn "8 秒内未连通 $testLabel。可能是网络、VPN、代理或 DNS 导致。"
     $choice = Read-Host "请切换 VPN/网络后输入 R 重试；输入 Q 退出"
     if ($choice -match '^[Qq]$') { throw "用户取消：GitHub 网络尚未连通。" }
   }
@@ -136,26 +224,48 @@ function Wait-ForGitHubNetwork {
 
 function Ensure-GitHubLogin {
   Write-Title "检查 GitHub 登录"
-  $loggedIn = Test-NativeProbe { & $script:GhPath auth status --hostname $GitHubHost }
+  $loggedIn = Test-GitHubCliProbe @("auth", "status", "--hostname", $GitHubHost) "GitHub 登录状态检查"
   if (-not $loggedIn) {
+    Write-Warn "检测到旧登录凭据无效，将先清理这条失效记录，再重新授权。"
+    & $script:GhPath auth logout --hostname $GitHubHost --user $GitHubAccount *> $null
     Write-Info "即将打开 GitHub 官方浏览器授权。这里只是登录，不会立即上传文件。"
+    Write-Warn "下一步出现验证码后，请在本窗口按一次 Enter 才会打开浏览器；不要按 Ctrl+C。"
     Invoke-Native $script:GhPath @("auth", "login", "--hostname", $GitHubHost, "--git-protocol", "https", "--web") "GitHub 登录失败"
+    if (-not (Test-GitHubCliProbe @("auth", "status", "--hostname", $GitHubHost) "授权结果检查" 10)) {
+      throw "浏览器授权结束，但 GitHub CLI 没有保存有效凭据。请确认浏览器页面显示授权成功，并检查 Windows 凭据管理器。"
+    }
   }
   Invoke-Native $script:GhPath @("auth", "setup-git", "--hostname", $GitHubHost) "Git 凭据配置失败"
-  Invoke-Native $script:GhPath @("api", "rate_limit") "GitHub API 连通性检查失败"
+  Write-Info "正在确认 GitHub API 可用（最多等待 10 秒）…"
+  if (-not (Test-GitHubCliProbe @("api", "rate_limit") "GitHub API 连通性检查" 10)) {
+    $detail = if ($script:LastGitHubProbeError) { "详细信息：$($script:LastGitHubProbeError)" } else { "没有收到具体错误信息。" }
+    throw "GitHub API 连通性检查失败。请确认加速器/本地代理仍在运行后重试。$detail"
+  }
   Write-Ok "GitHub 登录和 API 连接正常"
 }
 
 function Ensure-GitHubReady {
   if ($script:GitHubReady) { return }
   $script:GhPath = Resolve-GitHubCli
+  Enable-GitHubCliProxy
   Wait-ForGitHubNetwork
   Ensure-GitHubLogin
   $script:GitHubReady = $true
 }
 
+function Confirm-GitHubLoginBeforePublish {
+  Write-Info "正在在发布前再次确认 GitHub 登录状态…"
+  if (Test-GitHubCliProbe @("auth", "status", "--hostname", $GitHubHost) "发布前 GitHub 登录检查") { return }
+
+  # 打包可能持续较久；若令牌、VPN 或代理在此期间失效，不能把失败误判为
+  # “这个版本尚未发布”。重新走登录检查会在需要时发起新的浏览器授权。
+  Write-Warn "GitHub 登录已失效或不可用，发布已暂停；请按提示重新授权。"
+  $script:GitHubReady = $false
+  Ensure-GitHubReady
+}
+
 function Test-RemoteRepo([string]$RepoSlug) {
-  return Test-NativeProbe { & $script:GhPath repo view $RepoSlug --json nameWithOwner }
+  return Test-GitHubCliProbe @("repo", "view", $RepoSlug, "--json", "nameWithOwner") "GitHub 仓库访问检查"
 }
 
 function Ensure-RemoteRepo([string]$RepoSlug, [bool]$MustBePublic, [string]$Purpose) {
@@ -451,8 +561,10 @@ function Complete-ReleaseUpload([string]$Version, [string[]]$Assets, [string]$No
   $tag = "v$Version"
   Write-Title "发布到 GitHub Releases"
   Write-Info "目标：https://$GitHubHost/$ReleaseRepoSlug/releases/tag/$tag"
+  Confirm-GitHubLoginBeforePublish
 
-  $releaseExists = Test-NativeProbe { & $script:GhPath release view $tag --repo $ReleaseRepoSlug }
+  Write-Info "正在检查目标版本是否已存在（最多等待 $GitHubProbeTimeoutSeconds 秒）…"
+  $releaseExists = Test-GitHubCliProbe @("release", "view", $tag, "--repo", $ReleaseRepoSlug) "GitHub Release 检查"
   if (-not $releaseExists) {
     $arguments = @("release", "create", $tag) + $Assets + @(
       "--repo", $ReleaseRepoSlug,
@@ -478,7 +590,6 @@ function Complete-ReleaseUpload([string]$Version, [string[]]$Assets, [string]$No
 }
 
 function Resume-PendingRelease {
-  Write-Title "发现上次未完成的 Release"
   $pending = Get-Content $PendingReleasePath -Raw -Encoding UTF8 | ConvertFrom-Json
   $version = [string]$pending.version
   $notesPath = [string]$pending.notesPath
@@ -489,13 +600,30 @@ function Resume-PendingRelease {
     throw "待发布说明文件不存在或不在 .publish 安全目录中。"
   }
   $assets = Assert-ReleaseAssets $version
-  Write-Warn "待继续版本：v$version。不会重新改版本或重新打包。"
-  $confirm = Read-Host "检查安装包和说明后，输入 YES 或 PUBLISH 继续；其他输入退出"
-  if ($confirm.Trim() -notmatch '^(?i:YES|PUBLISH)$') { Write-Info "已保留待发布状态，下次仍可继续。"; return }
   Ensure-GitHubReady
   Ensure-RemoteRepo $ReleaseRepoSlug $true "公开安装包发布"
   Backup-Source "chore(release): prepare v$version"
   Complete-ReleaseUpload $version $assets $resolvedNotes
+}
+
+function Choose-PendingReleaseAction {
+  $pending = Get-Content $PendingReleasePath -Raw -Encoding UTF8 | ConvertFrom-Json
+  $version = [string]$pending.version
+  if ($version -notmatch '^\d+\.\d+\.\d+([+-][0-9A-Za-z.-]+)?$') { throw "待发布记录中的版本号无效。" }
+
+  Write-Title "发现上次未完成的 Release"
+  Write-Warn "上次已打包并备份源码，但 v$version 尚未确认发布完成。"
+  Write-Host "1. 继续发布 v$version（不重新打包）"
+  Write-Host "2. 暂不发布，回到主菜单重新选择操作"
+  Write-Host "0. 退出并保留这次待发布记录"
+  while ($true) {
+    switch (Read-Host "请输入序号") {
+      "1" { return "resume" }
+      "2" { return "menu" }
+      "0" { return "exit" }
+      default { Write-Warn "请输入 1、2 或 0。" }
+    }
+  }
 }
 
 function Publish-Release {
@@ -511,7 +639,8 @@ function Publish-Release {
   if ($version -notmatch '^\d+\.\d+\.\d+([+-][0-9A-Za-z.-]+)?$') { throw "版本号必须类似 1.0.1。" }
 
   $tag = "v$version"
-  if (Test-NativeProbe { & $script:GhPath release view $tag --repo $ReleaseRepoSlug }) { throw "发布页已经存在 $tag。为避免覆盖用户正在使用的版本，请换一个更高版本号。" }
+  Write-Info "正在检查版本号是否已被发布（最多等待 $GitHubProbeTimeoutSeconds 秒）…"
+  if (Test-GitHubCliProbe @("release", "view", $tag, "--repo", $ReleaseRepoSlug) "GitHub Release 检查") { throw "发布页已经存在 $tag。为避免覆盖用户正在使用的版本，请换一个更高版本号。" }
 
   if ($version -ne $currentVersion) {
     Push-Location $ProjectRoot
@@ -524,8 +653,8 @@ function Publish-Release {
   $notesPath = New-ReleaseNotes $version
   New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
   @{ version = $version; notesPath = $notesPath } | ConvertTo-Json | Set-Content $PendingReleasePath -Encoding UTF8
-  $confirm = Read-Host "确认版本、说明和目标仓库无误后，输入 YES 或 PUBLISH 继续"
-  if ($confirm.Trim() -notmatch '^(?i:YES|PUBLISH)$') {
+  $confirm = Read-Host "确认版本、说明和目标仓库无误后，输入 发布、确定、YES 或 PUBLISH 继续"
+  if ($confirm.Trim() -notmatch '^(?i:YES|PUBLISH)$|^(发布|确定)$') {
     Write-Info "已保留待发布状态。下次运行会直接从确认步骤继续，无需重新打包。"
     return
   }
@@ -551,19 +680,30 @@ try {
   Assert-Command "git" "请先安装 Git for Windows。"
   Assert-Command "node" "请先安装 Node.js LTS。"
   Assert-Command "npm" "npm 会随 Node.js 一起安装。"
+  $showMenuDirectly = $false
   if (Test-Path $PendingReleasePath) {
-    Resume-PendingRelease
-    Write-Ok "待发布流程处理结束。"
-    exit 0
+    $pendingAction = Choose-PendingReleaseAction
+    if ($pendingAction -eq "resume") {
+      Resume-PendingRelease
+      Write-Ok "待发布流程处理结束。"
+      exit 0
+    }
+    if ($pendingAction -eq "exit") {
+      Write-Info "已保留待发布记录；下次运行仍可继续发布。"
+      exit 0
+    }
+    Remove-Item -LiteralPath $PendingReleasePath -Force
+    Write-Info "已取消待发布状态；本地安装包和发布说明仍保留，不会删除。"
+    $showMenuDirectly = $true
   }
   $changeState = Get-ProjectChangeState
-  if ($changeState -eq "clean-and-synced") {
+  if (-not $showMenuDirectly -and $changeState -eq "clean-and-synced") {
     Write-Title "智能改动检查"
     Write-Ok "没有源码改动，本地提交也已同步到远程。"
     Write-Info "按约定，本次不会运行测试、打包或发布，避免生成没有意义的新版本。"
     exit 0
   }
-  if ($changeState -eq "unpushed-commits") {
+  if (-not $showMenuDirectly -and $changeState -eq "unpushed-commits") {
     Write-Title "发现上次尚未推送的提交"
     Write-Info "当前文件没有新改动，只需要补推源码；不会重新打包或发布。"
     $retryPush = Read-Host "输入 Y 重试推送；其他键退出"
@@ -571,8 +711,13 @@ try {
     exit 0
   }
 
-  Write-Title "智能改动检查"
-  Write-Ok "检测到新的项目文件改动，可按需要选择测试、备份、打包或正式发布。"
+  if ($showMenuDirectly) {
+    Write-Title "已回到主菜单"
+    Write-Info "你可以重新选择测试、备份、打包或新的正式发布流程。"
+  } else {
+    Write-Title "智能改动检查"
+    Write-Ok "检测到新的项目文件改动，可按需要选择测试、备份、打包或正式发布。"
+  }
 
   switch (Show-Menu) {
     "1" { Invoke-LocalValidation }
