@@ -38,12 +38,14 @@ describe("pet presentation interactions", () => {
     expect(mainSource).toContain('sendPetAction("dragged")');
     expect(mainSource).toContain('sendPetAction("drop_landing")');
     expect(mainSource).toContain('tray.on("click"');
-    expect(mainSource).toContain('const duration = 1_900');
+    expect(mainSource).toContain('animatePetMoveAndLand');
+    expect(mainSource).toContain('"startup-entrance", 1_900');
+    expect(mainSource).toContain('"reset-position"');
     expect(mainSource).toContain('maybeSendProactive');
     expect(mainSource).toContain('proactiveCooldownMinutes');
     expect(mainSource).toContain('settingsStore.clearAndReset()');
     expect(mainSource).toContain('activityClassifier.setApiConfigured(false)');
-    expect(mainSource).toContain('!settingsStore.get().firstRunConsent) void openConsole("home")');
+    expect(mainSource).toContain('shouldAutoShowOnboarding(settingsStore.get(), app.getVersion())');
     const settingsSource = await readFile(new URL("../electron/services/SettingsStore.ts", import.meta.url), "utf8");
     expect(settingsSource).toContain('firstRunConsent: false');
     expect(settingsSource).toContain('args: ["--autostart"]');

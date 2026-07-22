@@ -24,8 +24,12 @@ describe("desktop update contract", () => {
     const popup = await readFile(new URL("../src/update/main.ts", import.meta.url), "utf8");
     const vite = await readFile(new URL("../vite.config.ts", import.meta.url), "utf8");
     expect(service).toContain("autoDownload = false");
-    expect(service).toContain("autoInstallOnAppQuit = true");
-    expect(service).toContain("quitAndInstall(false, true)");
+    expect(service).toContain("autoInstallOnAppQuit = false");
+    expect(service).toContain("latestVerifiedVersion");
+    expect(service).toContain("downloadedVersion");
+    expect(service).toContain("downloadVerified");
+    expect(service).toContain("function releaseNotes");
+    expect(service).toContain("quitAndInstall(true, true)");
     for (const channel of ["updates:status", "updates:check", "updates:download", "updates:install", "updates:open-releases"]) {
       expect(main).toContain(channel);
       expect(preload).toContain(channel);
@@ -35,13 +39,37 @@ describe("desktop update contract", () => {
     expect(main).toContain("update-popup:close");
     expect(preload).toContain("update-popup:close");
     expect(popup).toContain('window.petAPI.console.open("updates")');
+    expect(popup).toContain('class="release-notes"');
     expect(vite).toContain('update: resolve(projectRoot, "update.html")');
     expect(service).toContain("发布页暂时还没有正式版本");
+  });
+
+  it("shows release-note update dialogs in both console and chat renderers", async () => {
+    const main = await readFile(new URL("../electron/main.ts", import.meta.url), "utf8");
+    const preload = await readFile(new URL("../electron/preload.cts", import.meta.url), "utf8");
+    const consoleRenderer = await readFile(new URL("../src/console/main.ts", import.meta.url), "utf8");
+    const chatRenderer = await readFile(new URL("../src/chat/main.ts", import.meta.url), "utf8");
+    const modal = await readFile(new URL("../src/shared/update-modal.ts", import.meta.url), "utf8");
+
+    expect(main).toContain('chatWindow?.webContents.send("updates:changed", status)');
+    expect(consoleRenderer).toContain("installUpdateModal()");
+    expect(chatRenderer).toContain("installUpdateModal()");
+    expect(modal).toContain("update-modal-window-scrim");
+    expect(modal).toContain('status.phase === "available"');
+    expect(modal).toContain('status.phase === "downloaded"')
+    expect(modal).toContain('window.petAPI.updates.status().then')
+    expect(modal).toContain("稍后更新");
+    expect(modal).toContain("稍后安装");
+    expect(modal).toContain("renderReleaseNotes(status.releaseNotes)");
+    expect(modal).toContain("data-update-release-link");
+    expect(main).toContain("updates:open-link");
+    expect(preload).toContain("updates:open-link");
   });
 
   it("only removes a recorded data directory carrying the app marker", async () => {
     const installer = await readFile(new URL("../build/installer.nsh", import.meta.url), "utf8");
     expect(installer).toContain("!macro customWelcomePage");
+    expect(installer).toContain("skipPageIfUpdated");
     expect(installer).toContain("!macro customUnWelcomePage");
     expect(installer).toContain("${IfNot} ${isUpdated}");
     expect(installer).toContain(".qpet-data-root");

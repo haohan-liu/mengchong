@@ -15,7 +15,7 @@ describe("reminder scheduler", () => {
     scheduler.tick(base, settings, true);
     let events = [] as ReturnType<ReminderScheduler["tick"]>;
     for (let second = 1; second <= 60; second += 1) events.push(...scheduler.tick({ ...base, timestamp: 1_000 + second * 1_000 }, settings, true));
-    expect(events.filter((event) => event.kind === "breaksCompleted")).toHaveLength(1);
+    expect(events.filter((event) => event.kind === "break")).toHaveLength(1);
     expect(scheduler.tick({ ...base, timestamp: 70_000 }, settings, false)).toEqual([]);
   });
 });

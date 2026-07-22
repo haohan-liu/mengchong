@@ -158,10 +158,33 @@ export interface ReminderSettings {
   startupDelaySeconds: number;
 }
 
+export interface WellbeingSettings {
+  enabled: boolean;
+  desktopHints: boolean;
+}
+
+export type NotificationKind = "reminder" | "assistant" | "general" | "hydration" | "break" | "plan";
+export type NotificationActionId = "acknowledge" | "hydrate" | "start-break" | "snooze" | "complete" | "view" | "chat";
+
+export interface NotificationAction {
+  id: NotificationActionId;
+  label: string;
+  style?: "primary" | "secondary" | "quiet";
+  snoozeMinutes?: number;
+  alternatives?: Array<{ label: string; minutes: number }>;
+}
+
 export interface AppNotification {
+  id: string;
+  sourceId?: string;
+  occurrenceId?: string;
   title: string;
   body: string;
-  kind: "reminder" | "assistant";
+  kind: NotificationKind;
+  priority: "low" | "normal" | "high";
+  actions: NotificationAction[];
+  createdAt: number;
+  expiresAt?: number;
 }
 
 export interface AiSettings {
@@ -182,9 +205,12 @@ export interface Settings {
   version: number;
   petName: string;
   firstRunConsent: boolean;
+  onboardingLastShownVersion: string;
+  suppressOnboardingAfterUpdates: boolean;
   appearance: AppearanceSettings;
   sensing: SensingSettings;
   reminders: ReminderSettings;
+  wellbeing: WellbeingSettings;
   ai: AiSettings;
   dataDirectory: string;
   manualMode: "auto" | "dnd" | "rest" | "energy_saving" | "low_battery" | "manual";
@@ -203,7 +229,85 @@ export interface DailyStatistic {
   hydrationCompleted: number;
   aiCalls: number;
   localReplies: number;
+  notificationsShown: number;
+  notificationsAcknowledged: number;
+  notificationsSnoozed: number;
+  plansCompleted: number;
+  vitalityMin: number;
+  vitalitySum: number;
+  vitalitySamples: number;
+  moodSum: number;
+  moodSamples: number;
+  recoverySeconds: number;
+  highLoadSeconds: number;
   categories: Record<ActivityKind, number>;
+}
+
+export type WellbeingState = "learning" | "energized" | "steady" | "tired" | "sleepy";
+export interface WellbeingSnapshot {
+  vitality: number;
+  mood: number;
+  state: WellbeingState;
+  estimated: boolean;
+  baselineDays: number;
+  updatedAt: number;
+}
+
+export type Weekday = 1 | 2 | 3 | 4 | 5 | 6 | 7;
+export type RecurrenceKind = "once" | "daily" | "weekly" | "monthly-date" | "monthly-last-day";
+export interface RecurrenceRule {
+  kind: RecurrenceKind;
+  weekdays?: Weekday[];
+  monthDay?: number;
+  endAt?: number | null;
+}
+
+export interface PlanTask {
+  id: string;
+  title: string;
+  notes: string;
+  priority: "low" | "normal" | "high";
+  tags: string[];
+  startAt: number;
+  dueAt: number | null;
+  timezone: string;
+  recurrence: RecurrenceRule;
+  reminderOffsets: number[];
+  status: "active" | "completed" | "archived" | "expired";
+  nextDueAt: number | null;
+  lastTriggeredAt: number | null;
+  snoozedUntil: number | null;
+  createdAt: number;
+  updatedAt: number;
+  revision: number;
+}
+
+export interface PlanOccurrence {
+  id: string;
+  taskId: string;
+  dueAt: number;
+  status: "pending" | "completed" | "snoozed" | "skipped" | "missed";
+  completedAt: number | null;
+  snoozedUntil: number | null;
+  createdAt: number;
+}
+
+export interface PlanInboxItem {
+  id: string;
+  taskId: string;
+  occurrenceId: string;
+  title: string;
+  dueAt: number;
+  read: boolean;
+  createdAt: number;
+}
+
+export interface PlansSnapshot {
+  version: number;
+  revision: number;
+  tasks: PlanTask[];
+  occurrences: PlanOccurrence[];
+  inbox: PlanInboxItem[];
 }
 
 export interface ActivityRule {
@@ -232,6 +336,7 @@ export interface ChatMessage {
   createdAt: number;
   source?: "api" | "local";
   error?: string;
+  actionCards?: ChatActionCard[];
 }
 export interface ChatSession { id: string; title: string; messages: ChatMessage[]; createdAt: number; updatedAt: number; }
 export interface ChatSessionSummary {
@@ -267,7 +372,7 @@ export interface PetSpeechEvent { text: string; kind: PetSpeechKind; }
 
 export interface AgentToolCall {
   id: string;
-  name: "get_activity_summary" | "create_reminder" | "complete_reminder" | "snooze_reminder" | "focus_timer" | "set_pet_action" | "show_notification" | "open_console" | "open_url" | "launch_app" | "read_current_context";
+  name: "get_activity_summary" | "get_system_summary" | "get_wellbeing" | "check_for_updates" | "find_plans" | "propose_accent_colors" | "propose_pet_scale" | "propose_plan" | "create_reminder" | "complete_reminder" | "snooze_reminder" | "focus_timer" | "set_pet_action" | "show_notification" | "open_console" | "open_url" | "launch_app" | "read_current_context";
   arguments: Record<string, unknown>;
   risk: "safe" | "confirm";
 }
@@ -280,6 +385,32 @@ export interface PetRuntimeStatus {
   activity: ActivitySnapshot;
   sensorHealthy: boolean;
   aiHealthy: boolean;
+  wellbeing: WellbeingSnapshot;
+}
+
+export type ChatActionCardType = "accent-colors" | "pet-scale" | "update" | "plan" | "shortcut";
+export interface ChatActionCard {
+  id: string;
+  /** Cards are visible only in the conversation that requested them. */
+  conversationId?: string;
+  type: ChatActionCardType;
+  revision: number;
+  title: string;
+  description: string;
+  payload: Record<string, unknown>;
+  actions: Array<{ id: string; label: string; style?: "primary" | "secondary" | "quiet" }>;
+  status: "pending" | "executed" | "failed" | "stale" | "cancelled";
+  result?: string;
+  createdAt: number;
+}
+
+export interface ChatActionResult {
+  ok: boolean;
+  status: ChatActionCard["status"];
+  message: string;
+  settings?: Settings;
+  plans?: PlansSnapshot;
+  update?: UpdateStatus;
 }
 
 export type UpdatePhase = "disabled" | "idle" | "checking" | "up-to-date" | "available" | "downloading" | "downloaded" | "error";
@@ -288,6 +419,11 @@ export interface UpdateStatus {
   phase: UpdatePhase;
   currentVersion: string;
   availableVersion: string | null;
+  latestVerifiedVersion: string | null;
+  downloadedVersion: string | null;
+  checkedAt: number | null;
+  downloadVerified: boolean;
+  releaseNotes: string | null;
   downloadPercent: number;
   message: string;
 }

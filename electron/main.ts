@@ -1,8 +1,8 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, screen, shell, Tray } from "electron";
-import { access, readFile, rm } from "node:fs/promises";
+import { access, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
-import type { ActivitySnapshot, AppNotification, PetRuntimeStatus, PetSpeechKind, PetState, Settings, UpdateStatus } from "../src/types.js";
+import type { ActivitySnapshot, AppNotification, NotificationAction, NotificationKind, PetRuntimeStatus, PetSpeechKind, PetState, Settings, UpdateStatus } from "../src/types.js";
 import { isDirectionalDragAction } from "../src/types.js";
 import { DRAG_RELEASE_SAMPLE_WINDOW_MS, dragGlideForRelease, type TimedDragPoint } from "../src/drag-motion.js";
 import { SettingsStore } from "./services/SettingsStore.js";
@@ -15,6 +15,9 @@ import { ReminderScheduler } from "./services/ReminderScheduler.js";
 import { UpdateService } from "./services/UpdateService.js";
 import { ActivityRuleStore } from "./services/ActivityRuleStore.js";
 import { ActivityClassifier } from "./services/ActivityClassifier.js";
+import { PlanService } from "./services/PlanService.js";
+import { WellbeingService } from "./services/WellbeingService.js";
+import { shouldAutoShowOnboarding } from "../src/shared/onboarding.js";
 
 const APP_STATES = new Set<PetState>(["BOOT", "APPEAR", "IDLE", "LISTENING", "USER_TYPING", "THINKING", "RESPONDING", "SUCCESS", "ERROR", "OFFLINE", "LOW_BATTERY", "SLEEP", "DRAGGING", "REACTION", "DISAPPEAR"]);
 const RELEASES_URL = "https://github.com/haohan-liu/mengchong-exe/releases";
@@ -48,7 +51,9 @@ let chatWindow: BrowserWindow | null = null;
 let updatePopupWindow: BrowserWindow | null = null;
 let notificationPopupWindow: BrowserWindow | null = null;
 let notificationPopupTimer: NodeJS.Timeout | null = null;
-let currentAppNotification: AppNotification = { title: "提醒", body: "", kind: "reminder" };
+let notificationPopupHovered = false;
+let currentAppNotification: AppNotification = { id: "empty", title: "提醒", body: "", kind: "reminder", priority: "normal", actions: [], createdAt: Date.now() };
+let notificationQueue: AppNotification[] = [];
 let tray: Tray | null = null;
 let settingsStore: SettingsStore;
 let dataStore: DataStore;
@@ -57,6 +62,8 @@ let agent: DeepSeekAgent;
 let agentTools: AgentTools;
 let updateService: UpdateService;
 let activityClassifier: ActivityClassifier;
+let planService: PlanService;
+let wellbeingService: WellbeingService;
 const reminderScheduler = new ReminderScheduler();
 interface ScreenPoint { x: number; y: number; }
 interface DragSession {
@@ -79,6 +86,8 @@ let petVisibilityTarget = true;
 let pendingVisibilityAcknowledge: { visible: boolean; resolve: () => void } | null = null;
 let lastUpdatePopupPhase = "";
 let visibilityAnimationToken = 0;
+let petPositionAnimationToken = 0;
+let petPositionAnimationActive = false;
 let petScaleAnimationTimer: NodeJS.Timeout | null = null;
 let petScaleAnimation: { targetScale: number; anchorRight: number; anchorBottom: number } | null = null;
 
@@ -97,13 +106,17 @@ const runtime: PetRuntimeStatus = {
     performance: { systemCpuPercent: 0, systemMemoryPercent: 0, petCpuPercent: 0, petMemoryMb: 0, petProcessCount: 0, sensorMemoryMb: 0, eventLoopLagMs: 0 }
   },
   sensorHealthy: false,
-  aiHealthy: false
+  aiHealthy: false,
+  wellbeing: { vitality: 70, mood: 70, state: "learning", estimated: false, baselineDays: 0, updatedAt: Date.now() }
 };
 
 function appRoot(): string { return app.getAppPath(); }
 function preloadPath(): string { return join(appRoot(), "dist-electron", "electron", "preload.cjs"); }
 function appIconPath(): string {
-  return app.isPackaged ? join(process.resourcesPath, "app-icon.png") : join(appRoot(), "assets", "icons", "app-icon.png");
+  const extension = process.platform === "win32" ? "ico" : "png";
+  return app.isPackaged
+    ? join(process.resourcesPath, `app-icon.${extension}`)
+    : join(appRoot(), "assets", "icons", `app-icon.${extension}`);
 }
 function appIcon() {
   const icon = nativeImage.createFromPath(appIconPath());
@@ -134,7 +147,7 @@ async function loadRenderer(window: BrowserWindow, page: "index.html" | "console
 function clampPetToWorkArea(): void {
   // setBounds emits move events. Clamping every animation frame competes with
   // resizing on Windows and is visible as a small shake at the window edge.
-  if (petScaleAnimationTimer) return;
+  if (petScaleAnimationTimer || petPositionAnimationActive) return;
   if (!petWindow || petWindow.isDestroyed()) return;
   const bounds = petWindow.getBounds();
   const area = screen.getDisplayMatching(bounds).workArea;
@@ -297,25 +310,22 @@ async function notifyPetRendererVisibility(window: BrowserWindow, visible: boole
   });
 }
 
-async function animatePetEntrance(window: BrowserWindow): Promise<void> {
+async function animatePetMoveAndLand(window: BrowserWindow, target: ScreenPoint, source: string, duration: number): Promise<void> {
   if (window.isDestroyed()) return;
-  await waitForRendererElement(window, ".pet-hit");
-  await new Promise((resolve) => setTimeout(resolve, 1_000));
-  if (window.isDestroyed()) return;
+  const token = ++petPositionAnimationToken;
+  petPositionAnimationActive = true;
+  dragSession = null;
+  clearDragTracking();
+  clearDragMomentum();
   const start = window.getBounds();
-  const area = screen.getDisplayMatching(start).workArea;
-  const target = {
-    x: area.x + area.width - start.width - 24,
-    y: area.y + area.height - start.height - 24
-  };
   runtime.state = "DRAGGING";
-  runtime.source = "startup-entrance";
+  runtime.source = source;
   sendPetAction("dragged");
+  broadcastRuntimeStatus();
   const startedAt = Date.now();
-  const duration = 1_900;
   await new Promise<void>((resolve) => {
     const move = () => {
-      if (window.isDestroyed()) { resolve(); return; }
+      if (window.isDestroyed() || token !== petPositionAnimationToken) { resolve(); return; }
       const progress = Math.min(1, (Date.now() - startedAt) / duration);
       const eased = progress < .5 ? 4 * progress ** 3 : 1 - Math.pow(-2 * progress + 2, 3) / 2;
       window.setPosition(
@@ -328,11 +338,27 @@ async function animatePetEntrance(window: BrowserWindow): Promise<void> {
     };
     move();
   });
-  if (window.isDestroyed()) return;
+  if (window.isDestroyed() || token !== petPositionAnimationToken) return;
+  window.setPosition(Math.round(target.x), Math.round(target.y), false);
   runtime.state = "REACTION";
-  runtime.source = "startup-entrance";
+  runtime.source = source;
   sendPetAction("drop_landing");
+  broadcastRuntimeStatus();
   await new Promise((resolve) => setTimeout(resolve, 1_100));
+  if (token === petPositionAnimationToken) petPositionAnimationActive = false;
+}
+
+async function animatePetEntrance(window: BrowserWindow): Promise<void> {
+  if (window.isDestroyed()) return;
+  await waitForRendererElement(window, ".pet-hit");
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  if (window.isDestroyed()) return;
+  const start = window.getBounds();
+  const area = screen.getDisplayMatching(start).workArea;
+  await animatePetMoveAndLand(window, {
+    x: area.x + area.width - start.width - 24,
+    y: area.y + area.height - start.height - 24
+  }, "startup-entrance", 1_900);
 }
 
 function animatePetScale(scale: number): void {
@@ -412,6 +438,8 @@ async function createPetWindow(): Promise<void> {
   petWindow.on("restore", reassertPetTopmost);
   petWindow.webContents.once("did-finish-load", reassertPetTopmost);
   petWindow.on("closed", () => {
+    petPositionAnimationToken += 1;
+    petPositionAnimationActive = false;
     dragSession = null;
     clearDragTracking();
     clearDragMomentum();
@@ -442,19 +470,26 @@ async function openConsole(tab = "home"): Promise<void> {
   if (consoleWindow && !consoleWindow.isDestroyed()) { syncWindowCaption(consoleWindow, "console"); consoleWindow.show(); consoleWindow.focus(); consoleWindow.webContents.send("console:navigate", tab); return; }
   const petName = settingsStore.get().petName;
   consoleWindow = new BrowserWindow({
-    width: 1080, height: 760, minWidth: 900, minHeight: 640, show: false,
+    // The extra 32 px preserve the original 1080 x 760 content area while
+    // providing a 16 px transparent canvas for rounded corners and shadow.
+    width: 1112, height: 792, minWidth: 932, minHeight: 672, show: false,
     title: `${petName}桌宠控制台`,
     icon: appIcon(),
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    hasShadow: false,
     webPreferences: { preload: preloadPath(), contextIsolation: true, nodeIntegration: false, sandbox: true }
   });
   const window = consoleWindow;
   reportRendererHealth(window, "console");
+  attachWindowStateNotifications(window);
   consoleWindow.setMenu(null);
   const reveal = () => {
     if (!window.isDestroyed()) { window.show(); window.focus(); }
   };
   window.once("ready-to-show", reveal);
-  window.webContents.once("did-finish-load", () => { syncWindowCaption(window, "console"); reveal(); });
+  window.webContents.once("did-finish-load", () => syncWindowCaption(window, "console"));
   window.on("focus", () => syncWindowCaption(window, "console"));
   consoleWindow.on("closed", () => { consoleWindow = null; });
   await loadRenderer(window, "console.html");
@@ -464,18 +499,22 @@ async function openChat(): Promise<void> {
   if (chatWindow && !chatWindow.isDestroyed()) { syncWindowCaption(chatWindow, "chat"); chatWindow.show(); chatWindow.focus(); return; }
   const petName = settingsStore.get().petName;
   chatWindow = new BrowserWindow({
-    width: 1180, height: 780, minWidth: 900, minHeight: 620, show: false,
+    width: 1212, height: 812, minWidth: 932, minHeight: 652, show: false,
     title: `和${petName}聊天`,
     icon: appIcon(),
-    backgroundColor: "#fbf7f9",
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    hasShadow: false,
     webPreferences: { preload: preloadPath(), contextIsolation: true, nodeIntegration: false, sandbox: true }
   });
   const window = chatWindow;
   reportRendererHealth(window, "chat");
+  attachWindowStateNotifications(window);
   window.setMenu(null);
   const reveal = () => { if (!window.isDestroyed()) { window.show(); window.focus(); } };
   window.once("ready-to-show", reveal);
-  window.webContents.once("did-finish-load", () => { syncWindowCaption(window, "chat"); reveal(); });
+  window.webContents.once("did-finish-load", () => syncWindowCaption(window, "chat"));
   window.on("focus", () => syncWindowCaption(window, "chat"));
   window.on("closed", () => { chatWindow = null; });
   await loadRenderer(window, "chat.html");
@@ -496,20 +535,82 @@ function notificationPopupPosition(width: number, height: number): { x: number; 
   return { x: area.x + area.width - width - 22, y: area.y + area.height - height - 22 - updateOffset };
 }
 
-function closeNotificationPopup(): void {
-  if (notificationPopupTimer) clearTimeout(notificationPopupTimer);
-  notificationPopupTimer = null;
-  if (notificationPopupWindow && !notificationPopupWindow.isDestroyed()) notificationPopupWindow.close();
+const NOTIFICATION_MIN_WIDTH = 316;
+const NOTIFICATION_START_WIDTH = 340;
+const NOTIFICATION_MAX_WIDTH = 480;
+const NOTIFICATION_HEIGHT = 84;
+
+function notificationActions(kind: NotificationKind): NotificationAction[] {
+  if (kind === "hydration") return [{ id: "hydrate", label: "喝好啦", style: "primary" }, { id: "snooze", label: "稍后 10 分钟", style: "secondary", snoozeMinutes: 10 }];
+  if (kind === "break") return [{ id: "start-break", label: "开始休息", style: "primary" }, { id: "snooze", label: "稍后 15 分钟", style: "secondary", snoozeMinutes: 15 }];
+  if (kind === "plan") return [{ id: "complete", label: "完成", style: "primary" }, { id: "snooze", label: "稍后 10 分钟", style: "secondary", snoozeMinutes: 10 }];
+  if (kind === "assistant") return [{ id: "chat", label: "聊天台", style: "secondary" }, { id: "acknowledge", label: "知道了", style: "primary" }];
+  return [{ id: "acknowledge", label: "知道了", style: "primary" }];
 }
 
-async function showAppNotification(notification: AppNotification): Promise<void> {
+function normalizeNotification(input: Partial<AppNotification> & Pick<AppNotification, "title" | "body">): AppNotification {
+  const kind = input.kind ?? "general";
+  return {
+    id: input.id || crypto.randomUUID(), sourceId: input.sourceId, occurrenceId: input.occurrenceId,
+    title: String(input.title).slice(0, 120), body: String(input.body).slice(0, 500), kind,
+    priority: input.priority ?? "normal", actions: input.actions?.length ? input.actions : notificationActions(kind),
+    createdAt: input.createdAt ?? Date.now(), expiresAt: input.expiresAt ?? Date.now() + 15_000
+  };
+}
+
+function clearNotificationTimer(): void { if (notificationPopupTimer) clearTimeout(notificationPopupTimer); notificationPopupTimer = null; }
+function raiseNotificationPopup(): void {
+  const window = notificationPopupWindow;
+  if (!window || window.isDestroyed()) return;
+  // Reminder actions must stay above the companion itself: the pet uses the
+  // screen-saver level with relative level 1, so reserve the next level here.
+  window.setAlwaysOnTop(true, PET_TOPMOST_LEVEL, PET_TOPMOST_RELATIVE_LEVEL + 1);
+  if (window.isVisible()) window.moveTop();
+}
+function scheduleNotificationClose(): void {
+  clearNotificationTimer();
+  if (notificationPopupHovered || currentAppNotification.id === "empty") return;
+  notificationPopupTimer = setTimeout(closeNotificationPopup, Math.max(1_000, (currentAppNotification.expiresAt ?? Date.now() + 15_000) - Date.now()));
+}
+function closeNotificationPopup(): void {
+  clearNotificationTimer();
+  currentAppNotification = { id: "empty", title: "提醒", body: "", kind: "reminder", priority: "normal", actions: [], createdAt: Date.now() };
+  if (notificationPopupWindow && !notificationPopupWindow.isDestroyed()) notificationPopupWindow.close();
+  const next = notificationQueue.shift();
+  if (next) void showAppNotification(next);
+}
+
+async function showAppNotification(input: Partial<AppNotification> & Pick<AppNotification, "title" | "body">): Promise<void> {
+  const notification = normalizeNotification(input);
+  if (currentAppNotification.id !== "empty") {
+    if (notification.sourceId && notification.sourceId === currentAppNotification.sourceId) {
+      currentAppNotification = notification;
+      notificationPopupWindow?.webContents.send("notification-popup:changed", notification);
+      raiseNotificationPopup();
+      scheduleNotificationClose();
+      return;
+    }
+    const duplicate = notification.sourceId && notificationQueue.some((item) => item.sourceId === notification.sourceId);
+    if (!duplicate) {
+      notificationQueue.push(notification);
+      notificationQueue.sort((left, right) => (right.priority === "high" ? 2 : right.priority === "normal" ? 1 : 0) - (left.priority === "high" ? 2 : left.priority === "normal" ? 1 : 0));
+    }
+    return;
+  }
   currentAppNotification = notification;
-  const width = 390, height = 132;
+  dataStore.increment("notificationsShown");
+  // Keep companion notices unobtrusive: this window sits above the taskbar,
+  // so it should read like a compact prompt rather than a full-size panel.
+  const width = NOTIFICATION_START_WIDTH, height = NOTIFICATION_HEIGHT;
   if (notificationPopupWindow && !notificationPopupWindow.isDestroyed()) {
     const position = notificationPopupPosition(width, height);
+    // A popup may already be open while its visual design changes. Keep its
+    // native bounds in sync with the content so the rounded card is never cut off.
+    notificationPopupWindow.setSize(width, height, false);
     notificationPopupWindow.setPosition(position.x, position.y, false);
     notificationPopupWindow.webContents.send("notification-popup:changed", notification);
     notificationPopupWindow.showInactive();
+    raiseNotificationPopup();
   } else {
     const position = notificationPopupPosition(width, height);
     notificationPopupWindow = new BrowserWindow({
@@ -521,15 +622,14 @@ async function showAppNotification(notification: AppNotification): Promise<void>
     const window = notificationPopupWindow;
     reportRendererHealth(window, "notification");
     window.setMenu(null);
-    window.setAlwaysOnTop(true, "floating");
-    const reveal = () => { if (!window.isDestroyed()) window.showInactive(); };
+    raiseNotificationPopup();
+    const reveal = () => { if (!window.isDestroyed()) { window.showInactive(); raiseNotificationPopup(); } };
     window.once("ready-to-show", reveal);
     window.webContents.once("did-finish-load", reveal);
     window.on("closed", () => { if (notificationPopupWindow === window) notificationPopupWindow = null; });
     await loadRenderer(window, "notification.html");
   }
-  if (notificationPopupTimer) clearTimeout(notificationPopupTimer);
-  notificationPopupTimer = setTimeout(closeNotificationPopup, 9_000);
+  scheduleNotificationClose();
 }
 
 async function showUpdatePopup(): Promise<void> {
@@ -537,11 +637,12 @@ async function showUpdatePopup(): Promise<void> {
     updatePopupWindow.showInactive();
     return;
   }
-  const width = 420;
-  const height = 278;
+  const width = 520;
+  const height = 116;
   const position = updatePopupPosition(width, height);
   if (notificationPopupWindow && !notificationPopupWindow.isDestroyed()) {
-    const notificationPosition = notificationPopupPosition(390, 132);
+    const bounds = notificationPopupWindow.getBounds();
+    const notificationPosition = notificationPopupPosition(bounds.width, bounds.height);
     notificationPopupWindow.setPosition(notificationPosition.x, notificationPosition.y, false);
   }
   updatePopupWindow = new BrowserWindow({
@@ -650,6 +751,16 @@ function syncWindowCaption(window: BrowserWindow, target: "console" | "chat"): v
   window.setTitle(target === "console" ? `${name}桌宠控制台` : `和${name}聊天`);
 }
 
+function attachWindowStateNotifications(window: BrowserWindow): void {
+  const emit = () => {
+    if (!window.isDestroyed()) window.webContents.send("window:maximized-changed", window.isMaximized());
+  };
+  window.on("maximize", emit);
+  window.on("unmaximize", emit);
+  window.on("restore", emit);
+  window.webContents.once("did-finish-load", emit);
+}
+
 function sendPetAction(action: string): void {
   if (!actionIds.has(action) && !isDirectionalDragAction(action)) return;
   runtime.action = action;
@@ -696,10 +807,32 @@ function broadcastRuntimeStatus(): void {
   petWindow?.webContents.send("pet:runtime-changed", snapshot);
   consoleWindow?.webContents.send("pet:runtime-changed", snapshot);
   chatWindow?.webContents.send("pet:runtime-changed", snapshot);
+  consoleWindow?.webContents.send("wellbeing:changed", snapshot.wellbeing);
+  chatWindow?.webContents.send("wellbeing:changed", snapshot.wellbeing);
+}
+
+function broadcastPlans(): void {
+  const snapshot = planService.snapshot();
+  consoleWindow?.webContents.send("plans:changed", snapshot);
+  chatWindow?.webContents.send("plans:changed", snapshot);
+}
+
+async function saveAgentSettings(mutator: (settings: Settings) => void): Promise<boolean> {
+  const next = settingsStore.get();
+  mutator(next);
+  const saved = await settingsStore.save(next);
+  applyAppearance(saved); applyBranding(saved);
+  petWindow?.webContents.send("settings:changed", saved);
+  consoleWindow?.webContents.send("settings:changed", saved);
+  chatWindow?.webContents.send("settings:changed", saved);
+  updatePopupWindow?.webContents.send("settings:changed", saved);
+  notificationPopupWindow?.webContents.send("settings:changed", saved);
+  return true;
 }
 
 function broadcastUpdateStatus(status: UpdateStatus): void {
   consoleWindow?.webContents.send("updates:changed", status);
+  chatWindow?.webContents.send("updates:changed", status);
   updatePopupWindow?.webContents.send("updates:changed", status);
   if (status.phase === lastUpdatePopupPhase) return;
   lastUpdatePopupPhase = status.phase;
@@ -722,7 +855,7 @@ async function resetLocalData(removeMarkedCustomDirectory: boolean): Promise<Set
   activityClassifier?.cancelPending();
   const previousDirectory = settingsStore.get().dataDirectory;
   try {
-    await Promise.all([dataStore.clearChats(), dataStore.clearStatistics(), dataStore.clearUsage(), activityClassifier.clear()]);
+    await Promise.all([dataStore.clearChats(), dataStore.clearStatistics(), dataStore.clearUsage(), activityClassifier.clear(), planService.clear(), wellbeingService.reset()]);
     const saved = await settingsStore.clearAndReset();
     activityClassifier.setApiConfigured(false);
     if (removeMarkedCustomDirectory && previousDirectory !== saved.dataDirectory) {
@@ -734,6 +867,9 @@ async function resetLocalData(removeMarkedCustomDirectory: boolean): Promise<Set
       }
     }
     await dataStore.load();
+    await planService.load();
+    await wellbeingService.load();
+    runtime.wellbeing = wellbeingService.snapshot();
     await activityClassifier.rules.load();
     await syncUninstallDataPath(saved.dataDirectory);
     runtime.activity = filterActivity(runtime.activity, saved);
@@ -878,30 +1014,48 @@ async function runSmokeTest(): Promise<void> {
   await openConsole();
   if (!consoleWindow) throw new Error("Console window was not created");
   await waitForRendererElement(consoleWindow, ".console-shell nav");
-  const onboardingReady = await consoleWindow.webContents.executeJavaScript(`(async () => {
+  const onboardingResult = await consoleWindow.webContents.executeJavaScript(`(async () => {
     const wait = () => new Promise(resolve => setTimeout(resolve, 40));
-    if (!document.querySelector('[data-onboarding]')) return false;
-    document.querySelector('[data-onboarding-next]')?.click(); await wait();
+    const waitFor = async (selector, timeout = 2500) => {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) { const element = document.querySelector(selector); if (element) return element; await wait(); }
+      return null;
+    };
+    if (!document.querySelector('[data-onboarding]')) return { completed: false, smoothContinuation: false, reason: 'missing-onboarding' };
+    document.querySelector('[data-onboarding-next]')?.click();
+    let smoothContinuation = false; const transitionDeadline = Date.now() + 600;
+    while (!smoothContinuation && Date.now() < transitionDeadline) {
+      const resumedMask = document.querySelector('[data-onboarding]'); const resumedSpotlight = resumedMask?.querySelector('.tour-spotlight');
+      smoothContinuation = Boolean(resumedMask?.classList.contains('tour-resume') && resumedSpotlight instanceof HTMLElement && getComputedStyle(resumedMask).animationName === 'none' && getComputedStyle(resumedSpotlight).transitionDuration !== '0s');
+      if (!smoothContinuation) await wait();
+    }
     const enable = document.querySelector('[data-command="onboarding-enable"]');
-    if (!(enable instanceof HTMLButtonElement)) return false;
-    enable.click(); await wait();
-    document.querySelector('[data-command="onboarding-ai-later"]')?.click(); await wait();
-    document.querySelector('[data-command="finish-onboarding"]')?.click(); await wait();
+    if (!(enable instanceof HTMLButtonElement)) return { completed: false, smoothContinuation, reason: 'missing-enable' };
+    enable.click();
+    const later = await waitFor('[data-command="onboarding-ai-later"]');
+    if (!(later instanceof HTMLButtonElement)) return { completed: false, smoothContinuation, reason: 'missing-ai-later' };
+    later.click();
+    const finish = await waitFor('[data-command="finish-onboarding"]');
+    if (!(finish instanceof HTMLButtonElement)) return { completed: false, smoothContinuation, reason: 'missing-finish' };
+    finish.click();
     const deadline = Date.now() + 2000;
     while (document.querySelector('[data-onboarding]') && Date.now() < deadline) await wait();
-    return !document.querySelector('[data-onboarding]');
-  })()`, true) as boolean;
-  if (!onboardingReady) throw new Error("First-run onboarding did not complete its consent flow");
+    return { completed: !document.querySelector('[data-onboarding]'), smoothContinuation, reason: 'finished' };
+  })()`, true) as { completed: boolean; smoothContinuation: boolean; reason: string };
+  if (!onboardingResult.completed || !onboardingResult.smoothContinuation) throw new Error(`First-run onboarding did not complete its consent flow: ${JSON.stringify(onboardingResult)}`);
   const sensorDeadline = Date.now() + 4_000;
   while (runtime.activity.sensorSource === "fallback" && Date.now() < sensorDeadline) await new Promise((resolve) => setTimeout(resolve, 100));
   if (runtime.activity.sensorSource === "fallback") throw new Error("Native/compatibility input sensor did not start");
   if (runtime.activity.performance.petMemoryMb <= 0) throw new Error("Performance telemetry did not report pet memory");
   const layoutReady = await consoleWindow.webContents.executeJavaScript(`(() => {
-    const main = document.querySelector('.console-shell > main');
+    const appWindow = document.querySelector('.app-window'); const shell = document.querySelector('.console-shell'); const main = document.querySelector('.console-shell > main');
     const performance = document.querySelector('[data-live="pet-memory"]');
-    return Boolean(main && performance && getComputedStyle(main).overflowY === 'auto');
+    if (!(appWindow instanceof HTMLElement) || !(shell instanceof HTMLElement) || !(main instanceof HTMLElement) || !performance) return false;
+    const appRect = appWindow.getBoundingClientRect(); const shellRect = shell.getBoundingClientRect();
+    return getComputedStyle(main).overflowY === 'auto' && Math.abs(appRect.width - (innerWidth - 32)) <= 1 && Math.abs(appRect.height - (innerHeight - 32)) <= 1 && Math.abs(shellRect.height - (appRect.height - 38)) <= 1;
   })()`, true) as boolean;
-  if (!layoutReady) throw new Error("Console fixed navigation/performance layout is not ready");
+  if (!layoutReady) throw new Error("Console rounded-window content dimensions are not preserved");
+  if (process.env.PET_SMOKE_CAPTURE_HOME) await writeFile(process.env.PET_SMOKE_CAPTURE_HOME, (await consoleWindow.webContents.capturePage()).toPNG());
   const sensingCycle = await consoleWindow.webContents.executeJavaScript(`(async () => {
     await window.petAPI.pet.pauseSensing(10);
     const paused = await window.petAPI.pet.getRuntime();
@@ -1051,7 +1205,7 @@ async function runSmokeTest(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 1_200));
   const scrollAfter = await consoleWindow.webContents.executeJavaScript(`document.querySelector('.workspace')?.scrollTop ?? -1`, true) as number;
   if (scrollBefore <= 0 || Math.abs(scrollAfter - scrollBefore) > 2) throw new Error(`Console scroll position changed without user action: ${scrollBefore} -> ${scrollAfter}`);
-  for (const tab of ["home", "appearance", "states", "privacy", "reminders", "ai", "stats", "storage", "updates"]) {
+  for (const tab of ["home", "appearance", "states", "privacy", "reminders", "plans", "ai", "stats", "updates"]) {
     await consoleWindow.webContents.executeJavaScript(`document.querySelector('[data-tab="${tab}"]')?.click()`, true);
     await new Promise((resolve) => setTimeout(resolve, 100));
     const before = await consoleWindow.webContents.executeJavaScript(`(() => { const main=document.querySelector('.workspace'); if(!(main instanceof HTMLElement))return -1; main.scrollTop=Math.min(main.scrollHeight, Math.max(0, main.scrollHeight-main.clientHeight)); return main.scrollTop; })()`, true) as number;
@@ -1059,7 +1213,45 @@ async function runSmokeTest(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 40));
     const after = await consoleWindow.webContents.executeJavaScript(`document.querySelector('.workspace')?.scrollTop ?? -1`, true) as number;
     if (Math.abs(after - before) > 2) throw new Error(`Console ${tab} page moved after activity update: ${before} -> ${after}`);
+    const horizontalLayout = await consoleWindow.webContents.executeJavaScript(`(() => {
+      const workspace = document.querySelector('.workspace'); const page = workspace?.querySelector('.page');
+      if (!(workspace instanceof HTMLElement) || !(page instanceof HTMLElement)) return { contained: false, reason: 'missing-layout' };
+      const pageRight = page.getBoundingClientRect().right;
+      const overflow = [...page.querySelectorAll('*')].filter((child) => child instanceof HTMLElement && child.getBoundingClientRect().right > pageRight + 1).slice(0, 12).map((child) => ({ tagName: child.tagName, className: child.className, right: Math.round(child.getBoundingClientRect().right), pageRight: Math.round(pageRight), width: Math.round(child.getBoundingClientRect().width) }));
+      return { contained: workspace.scrollWidth <= workspace.clientWidth + 1 && page.scrollWidth <= page.clientWidth + 1, workspace: [workspace.clientWidth, workspace.scrollWidth], page: [page.clientWidth, page.scrollWidth], overflow };
+    })()`, true) as { contained: boolean; workspace?: [number, number]; page?: [number, number]; overflow?: unknown[]; reason?: string };
+    if (!horizontalLayout.contained) throw new Error(`Console ${tab} page overflowed horizontally in its available content area: ${JSON.stringify(horizontalLayout)}`);
   }
+  if (process.env.PET_SMOKE_CAPTURE_STATS) {
+    await consoleWindow.webContents.executeJavaScript(`document.querySelector('[data-tab="stats"]')?.click()`, true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await writeFile(process.env.PET_SMOKE_CAPTURE_STATS, (await consoleWindow.webContents.capturePage()).toPNG());
+  }
+  if (process.env.PET_SMOKE_CAPTURE_PLANS) {
+    await consoleWindow.webContents.executeJavaScript(`(async () => {
+      const now = Date.now(); const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      await window.petAPI.plans.upsert({ id: 'smoke-plan-high', title: '完成本周项目复盘', notes: '整理本周进展、风险与下周优先事项，输出简短复盘结论。', startAt: now + 3_600_000, dueAt: now + 3_600_000, timezone, priority: 'high', tags: [], recurrence: { kind: 'once' }, reminderOffsets: [0], status: 'active', lastTriggeredAt: null, snoozedUntil: null });
+      await window.petAPI.plans.upsert({ id: 'smoke-plan-normal', title: '整理会议行动项', notes: '把讨论结果转成可执行的待办，并同步给相关同事。', startAt: now + 86_400_000, dueAt: now + 86_400_000, timezone, priority: 'normal', tags: [], recurrence: { kind: 'weekly', weekdays: [1] }, reminderOffsets: [0], status: 'active', lastTriggeredAt: null, snoozedUntil: null });
+      document.querySelector('[data-tab="plans"]')?.click(); await new Promise(resolve => setTimeout(resolve, 350));
+    })()`, true);
+    await writeFile(process.env.PET_SMOKE_CAPTURE_PLANS, (await consoleWindow.webContents.capturePage()).toPNG());
+  }
+  const planDialogContained = await consoleWindow.webContents.executeJavaScript(`(async () => {
+    document.querySelector('[data-tab="plans"]')?.click(); await new Promise(resolve => setTimeout(resolve, 100));
+    document.querySelector('[data-plan-new]')?.click(); await new Promise(resolve => setTimeout(resolve, 100));
+    const appWindow = document.querySelector('.app-window'); const dialog = document.querySelector('[data-plan-create-dialog]'); const footer = dialog?.querySelector('footer'); const scrim = document.querySelector('[data-console-modal-scrim]');
+    if (!(appWindow instanceof HTMLElement) || !(dialog instanceof HTMLDialogElement) || !(footer instanceof HTMLElement) || !(scrim instanceof HTMLElement) || !dialog.open || scrim.hidden) return false;
+    const appRect = appWindow.getBoundingClientRect(); const dialogRect = dialog.getBoundingClientRect(); const footerRect = footer.getBoundingClientRect(); const scrimRect = scrim.getBoundingClientRect();
+    const contained = dialogRect.top >= appRect.top - 1 && dialogRect.left >= appRect.left - 1 && dialogRect.right <= appRect.right + 1 && dialogRect.bottom <= appRect.bottom + 1;
+    const comfortableSpacing = dialogRect.top-appRect.top >= 22 && appRect.bottom-dialogRect.bottom >= 22 && Math.abs(dialogRect.height - Math.min(712, appRect.height-48)) <= 2;
+    const roundedScrim = Math.abs(scrimRect.width-appRect.width) <= 1 && Math.abs(scrimRect.height-appRect.height) <= 1 && parseFloat(getComputedStyle(scrim).borderRadius) >= 10;
+    return contained && comfortableSpacing && roundedScrim && footerRect.bottom <= dialogRect.bottom + 1;
+  })()`, true) as boolean;
+  if (!planDialogContained) throw new Error("Plan dialog lost height or escaped the rounded console content area");
+  if (process.env.PET_SMOKE_CAPTURE_CONSOLE) await writeFile(process.env.PET_SMOKE_CAPTURE_CONSOLE, (await consoleWindow.webContents.capturePage()).toPNG());
+  await consoleWindow.webContents.executeJavaScript(`document.querySelector('[data-plan-create-dialog]')?.close()`, true);
+  await consoleWindow.webContents.executeJavaScript(`document.querySelector('[data-tab="updates"]')?.click()`, true);
+  await new Promise((resolve) => setTimeout(resolve, 100));
   const updatePanelReady = await consoleWindow.webContents.executeJavaScript(`(() => {
     const panel = document.querySelector('[data-update-phase]');
     return panel?.getAttribute('data-update-phase') === 'disabled' && Boolean(panel.querySelector('button:disabled'));
@@ -1101,13 +1293,15 @@ async function runSmokeTest(): Promise<void> {
   if (!chatWindow) throw new Error("Agent chat window was not created");
   await waitForRendererElement(chatWindow, ".chat-shell .composer textarea");
   const chatContract = await chatWindow.webContents.executeJavaScript(`(() => {
-    const shell = document.querySelector('.chat-shell');
-    const topic = document.querySelector('.topic-list [data-topic-id]');
+    const appWindow = document.querySelector('.app-window'); const shell = document.querySelector('.chat-shell');
+    const topicList = document.querySelector('.topic-list');
     const context = document.querySelector('[data-show-context]');
     const quota = document.querySelector('[data-quota-meta]');
-    return Boolean(shell && topic && context && quota?.textContent?.includes('500'));
+    if (!(appWindow instanceof HTMLElement) || !(shell instanceof HTMLElement)) return false;
+    const appRect = appWindow.getBoundingClientRect(); const shellRect = shell.getBoundingClientRect();
+    return Boolean(topicList && context && quota?.textContent?.includes('/') && Math.abs(appRect.width - (innerWidth - 32)) <= 1 && Math.abs(appRect.height - (innerHeight - 32)) <= 1 && Math.abs(shellRect.height - (appRect.height - 38)) <= 1);
   })()`, true) as boolean;
-  if (!chatContract) throw new Error("Agent chat topics, context or quota controls were not ready");
+  if (!chatContract) throw new Error("Agent chat controls or rounded-window content dimensions were not ready");
   const chatAccent = await chatWindow.webContents.executeJavaScript(`getComputedStyle(document.querySelector('.chat-shell')).getPropertyValue('--accent').trim().toLowerCase()`, true) as string;
   if (chatAccent !== "#4f7fce") throw new Error(`Chat emphasis color did not follow the console: ${chatAccent}`);
   const chatSent = await chatWindow.webContents.executeJavaScript(`(() => {
@@ -1126,14 +1320,25 @@ async function runSmokeTest(): Promise<void> {
   if (!localReplyVisible) throw new Error("Agent chat did not label its local fallback reply");
   const initialTopicCount = (await dataStore.listChats()).length;
   await chatWindow.webContents.executeJavaScript(`document.querySelector('.new-topic')?.click()`, true);
+  const secondTopicSent = await chatWindow.webContents.executeJavaScript(`(() => {
+    const textarea = document.querySelector('.composer textarea');
+    const form = document.querySelector('.composer');
+    if (!(textarea instanceof HTMLTextAreaElement) || !(form instanceof HTMLFormElement)) return false;
+    textarea.value = '新建话题'; textarea.dispatchEvent(new Event('input', { bubbles: true })); form.requestSubmit(); return true;
+  })()`, true) as boolean;
+  if (!secondTopicSent) throw new Error("Agent chat did not accept a first message for the new topic");
   const topicDeadline = Date.now() + 2_000;
   while ((await dataStore.listChats()).length <= initialTopicCount && Date.now() < topicDeadline) await new Promise((resolve) => setTimeout(resolve, 40));
   if ((await dataStore.listChats()).length <= initialTopicCount) throw new Error("Agent chat did not create an independent topic");
   const contextOpened = await chatWindow.webContents.executeJavaScript(`(async () => {
-    document.querySelector('[data-show-context]')?.click(); await new Promise(resolve => setTimeout(resolve, 100));
-    const drawer = document.querySelector('.context-drawer'); return drawer instanceof HTMLElement && !drawer.hidden;
+    document.querySelector('[data-show-context]')?.click(); await new Promise(resolve => setTimeout(resolve, 350));
+    const shell = document.querySelector('.chat-shell'); const drawer = document.querySelector('.context-drawer'); const scrim = document.querySelector('.context-drawer-scrim');
+    if (!(shell instanceof HTMLElement) || !(drawer instanceof HTMLDialogElement) || !(scrim instanceof HTMLElement) || !drawer.open || scrim.hidden) return false;
+    const shellRect = shell.getBoundingClientRect(); const drawerRect = drawer.getBoundingClientRect();
+    return drawerRect.top >= shellRect.top && drawerRect.right <= shellRect.right && drawerRect.bottom <= shellRect.bottom && drawerRect.left >= shellRect.left;
   })()`, true) as boolean;
-  if (!contextOpened) throw new Error("Agent chat context detail drawer did not open");
+  if (!contextOpened) throw new Error("Agent chat context detail drawer did not open inside the rounded chat shell");
+  if (process.env.PET_SMOKE_CAPTURE) await writeFile(process.env.PET_SMOKE_CAPTURE, (await chatWindow.webContents.capturePage()).toPNG());
   chatWindow.close();
   if (!tray) throw new Error("Tray was not created");
   await setPetVisibility(true);
@@ -1152,6 +1357,8 @@ function registerIpc(): void {
     const origin = payload?.origin;
     const point = payload?.point;
     if (!isScreenPoint(origin) || !isScreenPoint(point)) return false;
+    petPositionAnimationToken += 1;
+    petPositionAnimationActive = false;
     clearDragMomentum();
     clearDragTracking();
     const bounds = petWindow.getBounds();
@@ -1199,6 +1406,10 @@ function registerIpc(): void {
   ipcMain.handle("pet:next-speech", (event, kind: PetSpeechKind) => {
     if (event.sender !== petWindow?.webContents) return "";
     return agent.nextCompanionLine(kind === "proactive" ? "proactive" : "click");
+  });
+  ipcMain.on("pet:bubble-presented", (event) => {
+    if (event.sender !== petWindow?.webContents) return;
+    reassertPetTopmost();
   });
   ipcMain.on("pet:preview-scale", (event, value: { scale?: number; bubbleScale?: number }) => {
     if (event.sender !== petWindow?.webContents && event.sender !== consoleWindow?.webContents) return;
@@ -1250,6 +1461,16 @@ function registerIpc(): void {
   ipcMain.handle("console:close", () => consoleWindow?.close());
   ipcMain.handle("chat:open", () => openChat());
   ipcMain.handle("chat:close", () => chatWindow?.close());
+  ipcMain.handle("window:minimize", (event, target: "console" | "chat") => {
+    const window = target === "console" ? consoleWindow : target === "chat" ? chatWindow : null;
+    if (event.sender === window?.webContents) window.minimize();
+  });
+  ipcMain.handle("window:toggle-maximize", (event, target: "console" | "chat") => {
+    const window = target === "console" ? consoleWindow : target === "chat" ? chatWindow : null;
+    if (event.sender !== window?.webContents) return false;
+    if (window.isMaximized()) window.unmaximize(); else window.maximize();
+    return window.isMaximized();
+  });
   ipcMain.handle("app:quit", () => app.quit());
 
   ipcMain.handle("settings:get", () => settingsStore.get());
@@ -1275,11 +1496,13 @@ function registerIpc(): void {
     if (previous.manualMode !== saved.manualMode || previous.manualState !== saved.manualState || previous.manualUntil !== saved.manualUntil) applyManualMode(saved);
     return saved;
   });
-  ipcMain.handle("settings:reset-position", () => {
-    if (!petWindow) return;
+  ipcMain.handle("settings:reset-position", async () => {
+    if (!petWindow || petWindow.isDestroyed()) return;
     const area = screen.getPrimaryDisplay().workArea;
     const bounds = petWindow.getBounds();
-    petWindow.setPosition(area.x + area.width - bounds.width - 24, area.y + area.height - bounds.height - 24);
+    const target = { x: area.x + area.width - bounds.width - 24, y: area.y + area.height - bounds.height - 24 };
+    const distance = Math.hypot(target.x - bounds.x, target.y - bounds.y);
+    await animatePetMoveAndLand(petWindow, target, "reset-position", Math.min(1_650, Math.max(720, distance * .9)));
   });
   ipcMain.handle("settings:set-api-key", async (_event, value: string) => {
     const saved = await settingsStore.setApiKey(value);
@@ -1305,6 +1528,9 @@ function registerIpc(): void {
       next.dataDirectory = nextPath;
       await settingsStore.save(next);
       await dataStore.load();
+      await planService.load();
+      await wellbeingService.load();
+      runtime.wellbeing = wellbeingService.snapshot();
       activityClassifier.cancelPending();
       await activityClassifier.rules.load();
       await syncUninstallDataPath(nextPath);
@@ -1319,21 +1545,74 @@ function registerIpc(): void {
   ipcMain.handle("activity-rules:update", (_event, id: string, changes: unknown) => activityClassifier.rules.update(String(id), changes as never));
   ipcMain.handle("activity-rules:delete", (_event, id: string) => activityClassifier.rules.remove(String(id)));
   ipcMain.handle("activity-rules:clear", () => activityClassifier.clear().then(() => true));
+  ipcMain.handle("wellbeing:get", () => wellbeingService.snapshot());
+  ipcMain.handle("plans:list", () => planService.snapshot());
+  ipcMain.handle("plans:upsert", async (_event, value: unknown) => { const snapshot = await planService.upsertTask((value && typeof value === "object" ? value : {}) as never); broadcastPlans(); return snapshot; });
+  ipcMain.handle("plans:complete", async (_event, id: string) => { const result = await planService.completeTask(String(id)); if (result.completed) { dataStore.increment("plansCompleted"); wellbeingService.reward("task"); runtime.wellbeing = wellbeingService.snapshot(); broadcastRuntimeStatus(); } broadcastPlans(); return result; });
+  ipcMain.handle("plans:archive", async (_event, id: string) => { const snapshot = await planService.archiveTask(String(id)); broadcastPlans(); return snapshot; });
+  ipcMain.handle("plans:delete", async (_event, id: string) => { const result = await planService.deleteTask(String(id)); broadcastPlans(); return result; });
+  ipcMain.handle("plans:history:clear", async () => { const snapshot = await planService.clearCompletedHistory(); broadcastPlans(); return snapshot; });
+  ipcMain.handle("plans:inbox:respond", async (_event, id: string, action: string, minutes?: number) => { const result = await planService.respondInbox(String(id), String(action), Number(minutes) || 10); if (result.completed) { dataStore.increment("plansCompleted"); wellbeingService.reward("task"); runtime.wellbeing = wellbeingService.snapshot(); broadcastRuntimeStatus(); } broadcastPlans(); return result; });
   ipcMain.handle("updates:status", () => updateService.status());
   ipcMain.handle("updates:check", () => updateService.check());
   ipcMain.handle("updates:download", () => updateService.download());
   ipcMain.handle("updates:install", () => updateService.install());
   ipcMain.handle("updates:open-releases", () => shell.openExternal(RELEASES_URL));
+  ipcMain.handle("updates:open-link", async (_event, rawUrl: string) => {
+    try {
+      const url = new URL(String(rawUrl));
+      if (url.protocol !== "https:") return false;
+      await shell.openExternal(url.toString());
+      return true;
+    } catch { return false; }
+  });
   ipcMain.handle("update-popup:close", (event) => {
     if (event.sender === updatePopupWindow?.webContents) updatePopupWindow.close();
   });
   ipcMain.handle("notification-popup:current", () => currentAppNotification);
+  ipcMain.handle("notification-popup:resize", (event, requestedWidth: number) => {
+    const window = notificationPopupWindow;
+    if (!window || window.isDestroyed() || event.sender !== window.webContents) return false;
+    const width = Math.max(NOTIFICATION_MIN_WIDTH, Math.min(NOTIFICATION_MAX_WIDTH, Math.round(Number(requestedWidth) || NOTIFICATION_START_WIDTH)));
+    const position = notificationPopupPosition(width, NOTIFICATION_HEIGHT);
+    window.setBounds({ x: position.x, y: position.y, width, height: NOTIFICATION_HEIGHT }, false);
+    return true;
+  });
   ipcMain.handle("notification-popup:close", (event) => {
     if (event.sender === notificationPopupWindow?.webContents) closeNotificationPopup();
   });
+  ipcMain.handle("notification-popup:hover", (event, hovered: boolean) => {
+    if (event.sender !== notificationPopupWindow?.webContents) return;
+    notificationPopupHovered = Boolean(hovered);
+    if (notificationPopupHovered) clearNotificationTimer(); else scheduleNotificationClose();
+  });
+  ipcMain.handle("notification-popup:respond", async (event, action: string, snoozeMinutes?: number) => {
+    if (event.sender !== notificationPopupWindow?.webContents) return false;
+    const notification = currentAppNotification;
+    let handled = false;
+    if (action === "chat") { await openChat(); handled = true; }
+    else if (action === "view") { await openConsole(notification.kind === "plan" ? "plans" : "reminders"); handled = true; }
+    else if (action === "hydrate") { dataStore.increment("hydrationCompleted"); dataStore.increment("notificationsAcknowledged"); wellbeingService.reward("rest"); handled = true; }
+    else if (action === "start-break") { dataStore.increment("breaksCompleted"); dataStore.increment("notificationsAcknowledged"); wellbeingService.reward("rest"); handled = true; }
+    else if (action === "acknowledge") { dataStore.increment("notificationsAcknowledged"); handled = true; }
+    else if (action === "snooze") {
+      const minutes = Math.max(1, Math.min(1_440, Math.round(Number(snoozeMinutes) || notification.actions.find((item) => item.id === "snooze")?.snoozeMinutes || 10)));
+      if (notification.kind === "hydration") reminderScheduler.snooze("hydration", minutes);
+      if (notification.kind === "break") reminderScheduler.snooze("break", minutes);
+      if (notification.kind === "plan") await planService.respond(notification, "snooze", minutes);
+      dataStore.increment("notificationsSnoozed"); handled = true;
+    } else if (action === "complete" && notification.kind === "plan") {
+      const result = await planService.respond(notification, "complete");
+      if (result.completed) { dataStore.increment("plansCompleted"); dataStore.increment("notificationsAcknowledged"); wellbeingService.reward("task"); }
+      broadcastPlans(); handled = true;
+    }
+    if (handled) { runtime.wellbeing = wellbeingService.snapshot(); broadcastRuntimeStatus(); closeNotificationPopup(); }
+    return handled;
+  });
   ipcMain.handle("notification-popup:open-reminders", async (event) => {
+    const tab = currentAppNotification.kind === "plan" ? "plans" : "reminders";
     if (event.sender === notificationPopupWindow?.webContents) closeNotificationPopup();
-    await openConsole("reminders");
+    await openConsole(tab);
   });
   ipcMain.handle("notification-popup:open-chat", async (event) => {
     if (event.sender === notificationPopupWindow?.webContents) closeNotificationPopup();
@@ -1377,6 +1656,7 @@ function registerIpc(): void {
   ipcMain.handle("chat:status", () => agent.status());
   ipcMain.handle("chat:suggestions", () => agent.suggestions());
   ipcMain.handle("chat:context-preview", () => agent.contextPreview());
+  ipcMain.handle("chat:execute-action", (event, id: string, action: string) => agentTools.executeActionCard(String(id), String(action), event.sender));
   ipcMain.handle("agent:approval", (_event, id: string, approved: boolean, allowConversation?: boolean, conversationId?: string) => agentTools.resolve(id, approved, Boolean(allowConversation), String(conversationId ?? "")));
   ipcMain.handle("agent:approval:clear", (event) => agentTools.clearConversationApprovals(event.sender));
 }
@@ -1397,6 +1677,11 @@ async function bootstrap(): Promise<void> {
   applyBranding(settingsStore.get());
   dataStore = new DataStore(() => settingsStore.get().dataDirectory);
   await dataStore.load();
+  planService = new PlanService(() => settingsStore.get().dataDirectory);
+  await planService.load();
+  wellbeingService = new WellbeingService(() => settingsStore.get().dataDirectory, dataStore);
+  await wellbeingService.load();
+  runtime.wellbeing = wellbeingService.snapshot();
   const activityRules = new ActivityRuleStore(() => settingsStore.get().dataDirectory);
   await activityRules.load();
   activityClassifier = new ActivityClassifier(settingsStore, dataStore, activityRules, (resolved) => {
@@ -1421,6 +1706,13 @@ async function bootstrap(): Promise<void> {
   agentTools = new AgentTools({
     getActivity: () => runtime.activity,
     getContext: () => agent.contextPreview(),
+    getSystemSummary: () => ({ activity: runtime.activity.activityLabel, wellbeing: runtime.wellbeing, update: updateService?.status(), plans: planService.summary(20) }),
+    getWellbeing: () => wellbeingService.snapshot(),
+    checkUpdates: () => updateService.check(),
+    findPlans: (query) => {
+      const needle = query.trim().toLowerCase();
+      return planService.summary(20).filter((plan) => !needle || `${plan.title} ${plan.recurrence}`.toLowerCase().includes(needle));
+    },
     getPetName: () => settingsStore.get().petName,
     getToolPermission: (name) => {
       const permissions = settingsStore.get().ai.toolPermissions;
@@ -1428,16 +1720,26 @@ async function bootstrap(): Promise<void> {
       return "ask";
     },
     setAction: (action) => { if (!actionIds.has(action) && !isDirectionalDragAction(action)) return false; sendPetAction(action); return true; },
+    setAccent: (color) => saveAgentSettings((settings) => { settings.appearance.accentColor = color; settings.appearance.recentAccentColors = [color, ...settings.appearance.recentAccentColors.filter((item) => item !== color)].slice(0, 6); }),
+    setScale: (scale) => saveAgentSettings((settings) => { settings.appearance.scale = scale; }),
+    createPlan: async (input) => { await planService.upsertTask(input); broadcastPlans(); return true; },
+    updateChatActionCard: (conversationId, card) => dataStore.updateChatActionCard(conversationId, card).then(() => undefined),
+    updateAction: async (action) => {
+      if (action === "open") { await openConsole("updates"); return { ok: true, message: "已打开更新页面" }; }
+      if (action === "download") { const status = await updateService.download(); return { ok: status.phase === "downloading" || status.phase === "downloaded", message: status.message }; }
+      if (action === "install") { const ok = await updateService.install(); return { ok, message: ok ? "已开始安装最新更新" : "当前还没有已验证的最新安装包" }; }
+      return { ok: false, message: "不支持的更新操作" };
+    },
     openConsole,
     showNotification: (title, body) => void showAppNotification({ title, body, kind: "assistant" })
   });
-  agent = new DeepSeekAgent(settingsStore, dataStore, () => runtime.activity, agentTools);
+  agent = new DeepSeekAgent(settingsStore, dataStore, () => runtime.activity, agentTools, () => planService.summary(20));
   updateService = new UpdateService({
     enabled: app.isPackaged && process.platform === "win32" && !smokeMode,
     onStatus: broadcastUpdateStatus,
     beforeInstall: async () => {
       sensor?.stop();
-      await dataStore.flush();
+      await Promise.all([dataStore.flush(), planService.flush(), wellbeingService.flush()]);
       flushingQuit = true;
     }
   });
@@ -1453,6 +1755,12 @@ async function bootstrap(): Promise<void> {
     const filtered = activityClassifier.classify(filterActivity(snapshot, settings));
     runtime.activity = filtered;
     runtime.sensorHealthy = snapshot.sensorSource !== "fallback";
+    const wellbeing = wellbeingService.update(filtered, settings);
+    runtime.wellbeing = wellbeing.snapshot;
+    if (wellbeing.changed && settings.wellbeing.desktopHints && filtered.presenceState !== "active") {
+      const copy = wellbeing.snapshot.state === "sleepy" ? "我也有点困啦，休息一下会更舒服。" : wellbeing.snapshot.state === "energized" ? "休息得不错，今天又恢复活力啦。" : "我会继续安静陪着你。";
+      petWindow?.webContents.send("pet:speech", { text: copy, kind: "proactive" });
+    }
     const sensingActive = settings.firstRunConsent && settings.sensing.enabled && (!runtime.sensingPausedUntil || runtime.sensingPausedUntil <= Date.now());
     if (!writesPaused && sensingActive) dataStore.recordActivity(filtered);
     void maybeSendProactive(filtered, settings);
@@ -1460,17 +1768,21 @@ async function bootstrap(): Promise<void> {
       && !(settings.reminders.meetingSilent && filtered.meeting)
       && !(settings.reminders.fullscreenSilent && filtered.fullscreen);
     for (const reminder of reminderScheduler.tick(filtered, settings, interruptionsAllowed)) {
-      void showAppNotification({ title: `${settings.petName} · ${reminder.title}`, body: reminder.body, kind: "reminder" });
-      dataStore.increment(reminder.kind);
+      const copyKind = reminder.kind;
+      void agent.nextReminderLine(copyKind, reminder.body).then((body) =>
+        showAppNotification({ title: `${settings.petName} · ${reminder.title}`, body, kind: reminder.kind })
+      );
     }
+    void planService.tick(filtered.timestamp, interruptionsAllowed).then((notifications) => notifications.forEach((notification) => void showAppNotification(notification)));
     if (settings.manualMode === "energy_saving" && filtered.timestamp - lastEnergySnapshotAt < 4_000) return;
     lastEnergySnapshotAt = filtered.timestamp;
+    broadcastRuntimeStatus();
     petWindow?.webContents.send("pet:activity", filtered);
     consoleWindow?.webContents.send("pet:activity", filtered);
     chatWindow?.webContents.send("pet:activity", filtered);
   });
   syncSensorForSettings(settingsStore.get());
-  if (!smokeMode && !settingsStore.get().firstRunConsent) void openConsole("home");
+  if (!smokeMode && shouldAutoShowOnboarding(settingsStore.get(), app.getVersion())) void openConsole("home");
   if (smokeMode) {
     try {
       await runSmokeTest();

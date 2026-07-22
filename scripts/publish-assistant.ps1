@@ -210,6 +210,17 @@ function Test-SourceFilesForSecrets {
       throw "发现不应上传的密钥/环境文件：$($badNames -join ', ')。请先移出项目或加入 .gitignore。"
     }
 
+    # 本地验包目录和视觉预览仅供开发检查，既不参与运行也不应进入源码备份。
+    # 即使有人手动 force-add 了它们，发布前也要明确中止，避免把大型 app.asar
+    # 或预览页意外推送到源码仓库。
+    $developmentOnly = @($files | Where-Object {
+      $_ -match '(^|/)(installer-check|artifacts|dist|dist-electron|release|release-final|release-icon-check|\.publish)/' -or
+      $_ -match '(^|/)(update-modal-preview\.html|notification-style-preview\.html|notification-preview\.css)$'
+    })
+    if ($developmentOnly.Count -gt 0) {
+      throw "发现仅供本地开发/验包的文件：$($developmentOnly -join ', ')。请取消暂存或移入已忽略目录后再发布。"
+    }
+
     $secretPattern = '(?:sk-[A-Za-z0-9]{24,}|gh[pousr]_[A-Za-z0-9]{30,})'
     foreach ($relativePath in $files) {
       $fullPath = Join-Path $ProjectRoot $relativePath
@@ -324,10 +335,24 @@ function Get-SuggestedPatchVersion([string]$CurrentVersion) {
   } catch { return $CurrentVersion }
 }
 
+function Assert-DesktopPetStopped {
+  $sensorProcesses = @(Get-Process -Name "pet-sensor" -ErrorAction SilentlyContinue)
+  if ($sensorProcesses.Count -eq 0) { return }
+
+  Write-Warn "检测到正在运行的珊珊桌宠占用了 pet-sensor.exe，继续会导致构建失败。"
+  if ((Read-Host "请先退出桌宠，关闭完成后输入 CONTINUE；其他输入取消") -cne "CONTINUE") {
+    throw "未确认关闭桌宠，已安全停止构建。"
+  }
+  if (@(Get-Process -Name "pet-sensor" -ErrorAction SilentlyContinue).Count -gt 0) {
+    throw "pet-sensor.exe 仍在运行。请完全退出桌宠后重新选择发布操作。"
+  }
+}
+
 function Invoke-ReleaseBuild {
   Write-Title "安装依赖并构建正式安装包"
   Push-Location $ProjectRoot
   try {
+    Assert-DesktopPetStopped
     Invoke-Native "npm" @("ci") "npm 依赖安装失败"
     Invoke-Native "npm" @("run", "dist") "测试或安装包构建失败"
   } finally { Pop-Location }
@@ -337,6 +362,7 @@ function Invoke-LocalValidation {
   Write-Title "只做本地完整测试"
   Push-Location $ProjectRoot
   try {
+    Assert-DesktopPetStopped
     Invoke-Native "npm" @("run", "build") "本地完整测试失败"
     Invoke-Native "npm" @("run", "smoke") "Electron 真实烟雾测试失败"
   } finally { Pop-Location }
@@ -464,10 +490,8 @@ function Resume-PendingRelease {
   }
   $assets = Assert-ReleaseAssets $version
   Write-Warn "待继续版本：v$version。不会重新改版本或重新打包。"
-  $confirm = Read-Host "检查安装包和说明后，输入“发布”、“确定”或 PUBLISH 继续；其他输入退出"
-  if ($confirm -cne "PUBLISH") {
-    if ($confirm.Trim() -notin @("发布", "确定")) { Write-Info "已保留待发布状态，下次仍可继续。"; return }
-  }
+  $confirm = Read-Host "检查安装包和说明后，输入 YES 或 PUBLISH 继续；其他输入退出"
+  if ($confirm.Trim() -notmatch '^(?i:YES|PUBLISH)$') { Write-Info "已保留待发布状态，下次仍可继续。"; return }
   Ensure-GitHubReady
   Ensure-RemoteRepo $ReleaseRepoSlug $true "公开安装包发布"
   Backup-Source "chore(release): prepare v$version"
@@ -498,12 +522,13 @@ function Publish-Release {
   Invoke-ReleaseBuild
   $assets = Assert-ReleaseAssets $version
   $notesPath = New-ReleaseNotes $version
-  $confirm = Read-Host "确认版本、说明和目标仓库无误后，输入“发布”、“确定”或 PUBLISH"
-  if ($confirm -cne "PUBLISH") {
-    if ($confirm.Trim() -notin @("发布", "确定")) { throw "未确认发布。安装包仍保留在 release 文件夹，可稍后重试。" }
-  }
   New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
   @{ version = $version; notesPath = $notesPath } | ConvertTo-Json | Set-Content $PendingReleasePath -Encoding UTF8
+  $confirm = Read-Host "确认版本、说明和目标仓库无误后，输入 YES 或 PUBLISH 继续"
+  if ($confirm.Trim() -notmatch '^(?i:YES|PUBLISH)$') {
+    Write-Info "已保留待发布状态。下次运行会直接从确认步骤继续，无需重新打包。"
+    return
+  }
   # 只有完整测试与打包通过、且用户明确确认发布后才提交源码。
   Backup-Source "chore(release): prepare v$version"
   Complete-ReleaseUpload $version $assets $notesPath

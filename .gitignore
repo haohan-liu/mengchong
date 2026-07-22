@@ -4,6 +4,7 @@ dist-electron/
 release/
 release-final/
 release-icon-check/
+installer-check/
 artifacts/
 .publish/
 .agents/
@@ -21,3 +22,7 @@ native/sensor/target/
 !.env.example
 .DS_Store
 Thumbs.db
+
+# Local visual-development previews; they are not runtime pages or release assets.
+update-modal-preview.html
+src/update-modal-preview/

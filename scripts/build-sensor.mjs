@@ -4,6 +4,16 @@ import { dirname, join } from "node:path";
 
 const root = process.cwd();
 const manifest = join(root, "native", "sensor", "Cargo.toml");
+if (process.platform === "win32") {
+  const runningSensor = spawnSync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-Command",
+    "$sensor = Get-Process -Name pet-sensor -ErrorAction SilentlyContinue; if ($sensor) { exit 20 }"
+  ], { encoding: "utf8" });
+  if (runningSensor.status === 20) {
+    console.error("检测到正在运行的珊珊桌宠占用了 pet-sensor.exe。请先退出桌宠，再重新构建或发布。");
+    process.exit(1);
+  }
+}
 const probe = spawnSync("cargo", ["--version"], { encoding: "utf8", shell: process.platform === "win32" });
 if (probe.status !== 0) {
   if (process.platform !== "win32") {

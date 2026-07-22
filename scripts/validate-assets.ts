@@ -5,9 +5,17 @@ import sharp from "sharp";
 const root = process.cwd();
 const manifest = JSON.parse(await readFile(join(root, "animations_manifest.json"), "utf8")) as Array<{ id: string; frames: number; playMode: string; returnTo: string | null; playback?: { enter?: { from: number; to: number }; sustain?: { from: number; to: number; mode?: string }; exit?: { from: number; to: number }; interruptPolicy?: string } }>;
 const spriteRoot = join(root, "public/sprites");
-const directories = (await readdir(spriteRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+const spriteEntries = (await readdir(spriteRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory());
+// `public/sprites` can also contain static artwork for auxiliary windows. An
+// action directory is identified by the numbered-frame naming convention.
+const directories = (await Promise.all(spriteEntries.map(async (entry) => {
+  const files = await readdir(join(spriteRoot, entry.name));
+  return files.some((file) => new RegExp(`^${entry.name}_\\d{3}\\.png$`).test(file)) ? entry.name : null;
+}))).filter((name): name is string => name !== null).sort();
 const expected = manifest.map((entry) => entry.id).sort();
-if (directories.length !== 24 || directories.join("|") !== expected.join("|")) throw new Error(`动作目录必须恰好为登记的 24 个，实际 ${directories.length}`);
+const extras = directories.filter((name) => !expected.includes(name));
+const missing = expected.filter((name) => !directories.includes(name));
+if (extras.length || missing.length) throw new Error(`动作帧目录与清单不一致：多余 ${extras.join(", ") || "无"}；缺失 ${missing.join(", ") || "无"}`);
 let total = 0;
 let loop = 0;
 let once = 0;

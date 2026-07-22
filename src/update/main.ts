@@ -3,7 +3,7 @@ import type { UpdateStatus } from "../types";
 
 const root = document.querySelector<HTMLElement>("#update-app")!;
 let status: UpdateStatus = {
-  phase: "checking", currentVersion: "", availableVersion: null, downloadPercent: 0, message: "正在读取更新信息…"
+  phase: "checking", currentVersion: "", availableVersion: null, latestVerifiedVersion: null, downloadedVersion: null, checkedAt: null, downloadVerified: false, releaseNotes: null, downloadPercent: 0, message: "正在读取更新信息…"
 };
 let petName = "桌宠";
 
@@ -50,11 +50,13 @@ function render(): void {
   const view = content(status);
   const percent = progress(status.downloadPercent);
   const isDownloading = status.phase === "downloading";
+  const notes = status.releaseNotes?.replace(/\s+/g, " ").trim();
   root.innerHTML = `<section class="update-card phase-${view.icon}" aria-live="polite">
     <button type="button" class="close" data-action="close" aria-label="稍后处理更新"><span></span><span></span></button>
-    <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
+    <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div><div class="pet-art" aria-hidden="true"><i></i><img src="./sprites/idle_breath/idle_breath_000.png"></div>
     <div class="topline"><div class="app-mark">${illustration(view.icon)}</div><div><span class="eyebrow">${escapeHtml(view.eyebrow)}</span><h1>${escapeHtml(view.title)}</h1></div></div>
     <p class="message">${escapeHtml(view.body)}</p>
+    ${notes ? `<p class="release-notes" title="${escapeHtml(status.releaseNotes ?? "")}"><b>本次更新：</b>${escapeHtml(notes)}</p>` : ""}
     <div class="version-row"><span>当前 <b>v${escapeHtml(status.currentVersion || "—")}</b></span><i></i><span>最新 <b>${escapeHtml(status.availableVersion ? `v${status.availableVersion}` : "等待确认")}</b></span></div>
     <div class="progress ${isDownloading ? "visible" : ""}" aria-label="更新下载进度"><div><i style="width:${percent}%"></i></div><span>${percent}%</span></div>
     <div class="actions">${view.primary ? `<button type="button" class="primary" data-action="${view.primary[1]}">${view.primary[0]}<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 4.5 12.5 10 7 15.5"/></svg></button>` : ""}<button type="button" class="secondary" data-action="${view.secondary[1]}">${view.secondary[0]}</button></div>

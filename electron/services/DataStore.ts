@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import type {
   ActivitySnapshot,
   ActivityKind,
+  ChatActionCard,
   ChatMessage,
   ChatMessagePage,
   ChatSession,
@@ -13,7 +14,7 @@ import type {
 import { activityKinds } from "../../src/types.js";
 import { productiveActivityKinds } from "../../src/shared/activity.js";
 
-const STATISTICS_VERSION = 4;
+const STATISTICS_VERSION = 5;
 const USAGE_VERSION = 1;
 const CHAT_INDEX_VERSION = 2;
 const MAX_CHAT_SESSIONS = 50;
@@ -30,6 +31,9 @@ function emptyDay(date = dayKey()): DailyStatistic {
   return {
     date, activeSeconds: 0, restSeconds: 0, productiveSeconds: 0, inputEvents: 0, appSwitches: 0,
     breaksCompleted: 0, hydrationCompleted: 0, aiCalls: 0, localReplies: 0,
+    notificationsShown: 0, notificationsAcknowledged: 0, notificationsSnoozed: 0, plansCompleted: 0,
+    vitalityMin: 100, vitalitySum: 0, vitalitySamples: 0, moodSum: 0, moodSamples: 0,
+    recoverySeconds: 0, highLoadSeconds: 0,
     categories: Object.fromEntries(categories.map((key) => [key, 0])) as Record<ActivityKind, number>
   };
 }
@@ -49,6 +53,17 @@ function normalizeDay(value: Partial<DailyStatistic>, repairLegacyInput = false,
     hydrationCompleted: Math.max(0, Math.round(Number(value.hydrationCompleted) || 0)),
     aiCalls: Math.max(0, Math.round(Number(value.aiCalls) || 0)),
     localReplies: Math.max(0, Math.round(Number(value.localReplies) || 0)),
+    notificationsShown: Math.max(0, Math.round(Number(value.notificationsShown) || 0)),
+    notificationsAcknowledged: Math.max(0, Math.round(Number(value.notificationsAcknowledged) || 0)),
+    notificationsSnoozed: Math.max(0, Math.round(Number(value.notificationsSnoozed) || 0)),
+    plansCompleted: Math.max(0, Math.round(Number(value.plansCompleted) || 0)),
+    vitalityMin: Number.isFinite(Number(value.vitalityMin)) ? Math.min(100, Math.max(0, Number(value.vitalityMin))) : 100,
+    vitalitySum: Math.max(0, Number(value.vitalitySum) || 0),
+    vitalitySamples: Math.max(0, Math.round(Number(value.vitalitySamples) || 0)),
+    moodSum: Math.max(0, Number(value.moodSum) || 0),
+    moodSamples: Math.max(0, Math.round(Number(value.moodSamples) || 0)),
+    recoverySeconds: Math.max(0, Number(value.recoverySeconds) || 0),
+    highLoadSeconds: Math.max(0, Number(value.highLoadSeconds) || 0),
     categories: Object.fromEntries(categories.map((key) => [key, clearLegacyCategories ? 0 : Math.max(0, Number(value.categories?.[key]) || 0)])) as Record<ActivityKind, number>
   };
 }
@@ -69,13 +84,38 @@ function normalizeMessage(value: unknown): ChatMessage | null {
   if (!value || typeof value !== "object") return null;
   const item = value as Partial<ChatMessage>;
   if ((item.role !== "user" && item.role !== "assistant") || typeof item.content !== "string") return null;
+  const actionCards = Array.isArray(item.actionCards) ? item.actionCards.flatMap((card) => {
+    if (!card || typeof card !== "object") return [];
+    const value = card as Partial<ChatActionCard>;
+    const type = ["accent-colors", "pet-scale", "update", "plan", "shortcut"].includes(String(value.type)) ? value.type as ChatActionCard["type"] : null;
+    const status = ["pending", "executed", "failed", "stale", "cancelled"].includes(String(value.status)) ? value.status as ChatActionCard["status"] : null;
+    if (!value.id || !type || !status) return [];
+    return [{
+      id: String(value.id),
+      ...(value.conversationId ? { conversationId: String(value.conversationId) } : {}),
+      type,
+      revision: Number(value.revision) || Date.now(),
+      title: String(value.title ?? "建议").slice(0, 160),
+      description: String(value.description ?? "").slice(0, 4_000),
+      payload: value.payload && typeof value.payload === "object" ? structuredClone(value.payload) : {},
+      actions: Array.isArray(value.actions) ? value.actions.slice(0, 12).map((action) => ({
+        id: String(action.id ?? "").slice(0, 120),
+        label: String(action.label ?? "操作").slice(0, 80),
+        ...(["primary", "secondary", "quiet"].includes(String(action.style)) ? { style: action.style as "primary" | "secondary" | "quiet" } : {})
+      })).filter((action) => action.id) : [],
+      status,
+      ...(value.result ? { result: String(value.result).slice(0, 500) } : {}),
+      createdAt: Number(value.createdAt) || Date.now()
+    } satisfies ChatActionCard];
+  }).slice(-12) : [];
   return {
     id: String(item.id || crypto.randomUUID()),
     role: item.role,
     content: item.content.slice(0, 40_000),
     createdAt: Number(item.createdAt) || Date.now(),
     ...(item.source === "api" || item.source === "local" ? { source: item.source } : {}),
-    ...(item.error ? { error: String(item.error).slice(0, 300) } : {})
+    ...(item.error ? { error: String(item.error).slice(0, 300) } : {}),
+    ...(actionCards.length ? { actionCards } : {})
   };
 }
 
@@ -350,7 +390,7 @@ export class DataStore {
     this.scheduleStatisticsSave();
   }
 
-  increment(field: "aiCalls" | "localReplies" | "breaksCompleted" | "hydrationCompleted"): void {
+  increment(field: "aiCalls" | "localReplies" | "breaksCompleted" | "hydrationCompleted" | "notificationsShown" | "notificationsAcknowledged" | "notificationsSnoozed" | "plansCompleted"): void {
     let day = this.days.find((entry) => entry.date === dayKey());
     if (!day) { day = emptyDay(); this.days.push(day); }
     day[field] += 1;
@@ -360,6 +400,23 @@ export class DataStore {
       void this.saveUsage().catch((error) => console.error("Usage save failed:", error));
     }
     void this.saveStatistics().catch((error) => console.error("Statistics save failed:", error));
+  }
+
+  recordWellbeing(values: { vitality: number; mood: number; recovering: boolean; highLoad: boolean }, elapsedSeconds: number, time = Date.now()): void {
+    let day = this.days.find((entry) => entry.date === dayKey(time));
+    if (!day) { day = emptyDay(dayKey(time)); this.days.push(day); }
+    const elapsed = Math.max(0, Math.min(60, elapsedSeconds));
+    const vitality = Math.max(0, Math.min(100, Number(values.vitality) || 0));
+    const mood = Math.max(0, Math.min(100, Number(values.mood) || 0));
+    day.vitalityMin = Math.min(day.vitalityMin, vitality);
+    day.vitalitySum += vitality;
+    day.vitalitySamples += 1;
+    day.moodSum += mood;
+    day.moodSamples += 1;
+    if (values.recovering) day.recoverySeconds += elapsed;
+    if (values.highLoad) day.highLoadSeconds += elapsed;
+    this.pruneDays();
+    this.scheduleStatisticsSave();
   }
 
   getStatistics(days: number): StatisticsSummary {
@@ -512,6 +569,21 @@ export class DataStore {
       session.title = storedUser.content.replace(/\s+/g, " ").trim().slice(0, 28) || "新对话";
     }
     await this.persistSession(session);
+  }
+
+  async updateChatActionCard(sessionId: string, card: ChatActionCard): Promise<boolean> {
+    const session = await this.loadChat(sessionId);
+    if (!session) return false;
+    let changed = false;
+    session.messages = session.messages.map((message) => {
+      if (!message.actionCards?.some((item) => item.id === card.id)) return message;
+      changed = true;
+      return { ...message, actionCards: message.actionCards.map((item) => item.id === card.id ? structuredClone(card) : item) };
+    });
+    if (!changed) return false;
+    session.updatedAt = Date.now();
+    await this.persistSession(session);
+    return true;
   }
 
 }

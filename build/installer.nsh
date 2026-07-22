@@ -1,6 +1,9 @@
 !macro customWelcomePage
   !define MUI_WELCOMEPAGE_TITLE "欢迎来到 ${PRODUCT_NAME}"
-  !define MUI_WELCOMEPAGE_TEXT "珊珊会陪你度过每一个专注时刻。$\r$\n$\r$\n安装只会写入应用运行所需的本地文件，不会读取或上传你的个人内容。"
+  !define MUI_WELCOMEPAGE_TEXT "轻盈陪伴，从这一刻开始。$\r$\n$\r$\n首次安装可以自由选择路径；升级会自动沿用当前安装与数据。"
+  ; electron-builder defines this macro after its NSIS helper includes are loaded.
+  ; It skips the page on an upgrade while keeping it for a first installation.
+  !insertmacro skipPageIfUpdated
   !insertmacro MUI_PAGE_WELCOME
 !macroend
 

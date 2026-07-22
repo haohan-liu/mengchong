@@ -3,11 +3,12 @@ import { readFile } from "node:fs/promises";
 
 describe("one-click publish assistant contract", () => {
   it("keeps repository configuration centralized and separates source backup from release assets", async () => {
-    const [script, launcher, setupScript, setupLauncher, npmrc, ignore, guide] = await Promise.all([
+    const [script, launcher, setupScript, setupLauncher, starter, npmrc, ignore, guide] = await Promise.all([
       readFile(new URL("../scripts/publish-assistant.ps1", import.meta.url), "utf8"),
       readFile(new URL("../一键备份与发布.bat", import.meta.url), "utf8"),
       readFile(new URL("../scripts/setup-dev-environment.ps1", import.meta.url), "utf8"),
       readFile(new URL("../一键安装开发环境.bat", import.meta.url), "utf8"),
+      readFile(new URL("../启动桌宠.bat", import.meta.url), "utf8"),
       readFile(new URL("../.npmrc", import.meta.url), "utf8"),
       readFile(new URL("../.gitignore", import.meta.url), "utf8"),
       readFile(new URL("../docs/发布与迭代指南.md", import.meta.url), "utf8")
@@ -24,7 +25,8 @@ describe("one-click publish assistant contract", () => {
     expect(script).toContain('"release", "create", $tag');
     expect(script).toContain('$ArtifactPrefix-$Version.exe.blockmap');
     expect(script).toContain('Join-Path $releaseDirectory "latest.yml"');
-    expect(script).toContain('if ($confirm -cne "PUBLISH")');
+    expect(script).toContain("^(?i:YES|PUBLISH)$");
+    expect(script).toContain("无需重新打包");
     expect(script).toContain('if ($confirm -cne "REPLACE")');
     expect(script).toContain('return "clean-and-synced"');
     expect(script).toContain("没有源码改动，本地提交也已同步到远程");
@@ -46,6 +48,8 @@ describe("one-click publish assistant contract", () => {
     expect(setupLauncher).not.toContain("chcp 65001");
     expect(launcher).toContain("pause >nul");
     expect(setupLauncher).toContain("pause >nul");
+    expect(starter).toContain("npm.cmd ci --include=dev");
+    expect(starter).toContain(":wait-for-electron");
     expect(script).toContain("LauncherCheck");
     expect(setupScript).toContain("LauncherCheck");
     expect(setupScript).toContain('$MinimumNodeMajor = 22');

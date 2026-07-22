@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DataStore } from "../electron/services/DataStore";
-import type { ActivitySnapshot } from "../src/types";
+import type { ActivitySnapshot, ChatActionCard } from "../src/types";
 
 const paths: string[] = [];
 afterEach(async () => Promise.all(paths.splice(0).map((path) => rm(path, { recursive: true, force: true }))));
@@ -42,7 +42,7 @@ describe("statistics aggregation", () => {
     expect(summary.today.restSeconds).toBe(0);
     expect(summary.today.productiveSeconds).toBe(1);
     const persisted = JSON.parse(await readFile(join(root, "statistics.json"), "utf8"));
-    expect(persisted.version).toBe(4);
+    expect(persisted.version).toBe(5);
   });
 
   it("repairs legacy rolling-window input totals once", async () => {
@@ -135,6 +135,30 @@ describe("statistics aggregation", () => {
     await reloaded.load();
     expect(await reloaded.listChats()).toHaveLength(1);
     expect((await reloaded.messages(first.id)).messages[1]?.source).toBe("local");
+  });
+
+  it("persists action cards beside their assistant reply and records cancellation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "qpet-chat-actions-")); paths.push(root);
+    const store = new DataStore(() => root);
+    await store.load();
+    const session = await store.createChat("计划草案");
+    const card = {
+      id: "card-1", conversationId: session.id, type: "plan", revision: 1,
+      title: "整理项目资料", description: "内容：整理文件并列出缺失项\n时间：明天 09:00",
+      payload: { title: "整理项目资料" },
+      actions: [{ id: "create", label: "确认创建", style: "primary" }, { id: "cancel", label: "取消", style: "quiet" }],
+      status: "pending", createdAt: Date.now()
+    } satisfies ChatActionCard;
+    await store.appendChat(session.id,
+      { role: "user", content: "帮我安排计划", createdAt: Date.now() },
+      { role: "assistant", content: "请核对下面的草案。", createdAt: Date.now(), source: "api", actionCards: [card] });
+    expect((await store.messages(session.id)).messages[1]?.actionCards?.[0]?.title).toBe("整理项目资料");
+    const cancelled = { ...card, status: "cancelled", result: "已取消，没有更改任何设置或计划", revision: 2 } satisfies ChatActionCard;
+    expect(await store.updateChatActionCard(session.id, cancelled)).toBe(true);
+    await store.flush();
+    const reloaded = new DataStore(() => root);
+    await reloaded.load();
+    expect((await reloaded.messages(session.id)).messages[1]?.actionCards?.[0]).toEqual(expect.objectContaining({ status: "cancelled", result: cancelled.result }));
   });
 
   it("lazily migrates legacy chats and pages messages from newest to oldest", async () => {

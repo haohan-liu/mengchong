@@ -2,7 +2,7 @@ export type IconName =
   | "home" | "palette" | "sparkles" | "shield" | "clock" | "brain" | "chart" | "database"
   | "close" | "check" | "heart" | "message" | "pause" | "play" | "activity" | "keyboard" | "coffee"
   | "refresh" | "folder" | "trash" | "rotate" | "key" | "eye" | "lock"
-  | "moon" | "sun" | "monitor" | "info" | "external" | "edit" | "chevron";
+  | "moon" | "sun" | "monitor" | "info" | "external" | "edit" | "copy" | "chevron";
 
 const paths: Record<IconName, string> = {
   home: '<path d="M3 10.8 12 3l9 7.8"/><path d="M5.5 9.7V21h13V9.7"/><path d="M9.5 21v-6h5v6"/>',
@@ -35,6 +35,7 @@ const paths: Record<IconName, string> = {
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/>',
   external: '<path d="M14 4h6v6M20 4l-9 9"/><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6"/>',
   edit: '<path d="m4 20 4.5-1 10-10-3.5-3.5-10 10L4 20Z"/><path d="m13.5 7 3.5 3.5"/>',
+  copy: '<rect x="8" y="8" width="11" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2"/>',
   chevron: '<path d="m9 18 6-6-6-6"/>'
 };
 

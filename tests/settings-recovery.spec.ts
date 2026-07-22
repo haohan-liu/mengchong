@@ -25,5 +25,7 @@ describe("settings recovery", () => {
     expect(settings.ai.baseUrl).toBe("https://api.deepseek.com");
     expect(settings.ai.model).toBe("deepseek-v4-flash");
     expect(settings.ai.monthlyLimit).toBe(500);
+    expect(settings.onboardingLastShownVersion).toBe("");
+    expect(settings.suppressOnboardingAfterUpdates).toBe(false);
   });
 });

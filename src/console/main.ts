@@ -1,9 +1,12 @@
 import "./styles.css";
 import animations from "../../animations_manifest.json";
-import type { ActivityKind, ActivityRule, ActivitySnapshot, AnimationDefinition, PetRuntimeStatus, PetState, Settings, StatisticsSummary, UpdateStatus } from "../types";
+import appIconUrl from "../../assets/icons/app-icon.png";
+import type { ActivityKind, ActivityRule, ActivitySnapshot, AnimationDefinition, PetRuntimeStatus, PetState, PlansSnapshot, Settings, StatisticsSummary, UpdateStatus } from "../types";
 import { activityGroups, activityLabels } from "../shared/activity";
 import { buttonLabel, escapeHtml, icon, safeAccent, sectionHeading, type IconName } from "./ui";
 import { formatCount, formatDuration } from "./format";
+import { installUpdateModal } from "../shared/update-modal";
+import { onboardingDisplayReason } from "../shared/onboarding";
 
 const recommendedAccents = [
   ["珊瑚红", "#e94f64"], ["蜜桃橙", "#e87955"], ["鸢尾紫", "#8267c7"],
@@ -37,8 +40,8 @@ function hslToHex(hue: number, saturation: number, lightness: number): string {
 
 const tabs = [
   ["home", "总览", "home"], ["appearance", "外观与桌宠", "palette"], ["states", "状态与动作", "sparkles"],
-  ["privacy", "感知与隐私", "shield"], ["reminders", "提醒与陪伴", "clock"], ["ai", "智能体 API", "brain"],
-  ["stats", "数据统计", "chart"], ["storage", "数据与存储", "database"], ["updates", "关于与更新", "info"]
+  ["privacy", "隐私与数据", "shield"], ["reminders", "提醒与陪伴", "clock"], ["plans", "计划中心", "clock"], ["ai", "智能体 API", "brain"],
+  ["stats", "数据统计", "chart"], ["updates", "关于与更新", "info"]
 ] as const satisfies ReadonlyArray<readonly [string, string, IconName]>;
 
 class ConsoleApp {
@@ -49,9 +52,13 @@ class ConsoleApp {
   private activityRules: ActivityRule[] = [];
   private runtime!: PetRuntimeStatus;
   private updateStatus!: UpdateStatus;
+  private plans!: PlansSnapshot;
   private onboardingOpen = false;
   private onboardingStep = 0;
   private onboardingFinishTab: "home" | "ai" = "home";
+  private onboardingSuppressFuture = false;
+  private onboardingHasEntered = false;
+  private onboardingTransitionFrom: { left:number; top:number; width:number; height:number } | null = null;
   private activity!: ActivitySnapshot;
   private rangeSaveTimer = 0;
   private toastTimer = 0;
@@ -61,10 +68,18 @@ class ConsoleApp {
   private root = document.querySelector<HTMLElement>("#console-app")!;
 
   async mount(): Promise<void> {
-    [this.settings, this.stats, this.runtime, this.updateStatus, this.activityRules] = await Promise.all([
-      window.petAPI.settings.get(), window.petAPI.statistics.get(31), window.petAPI.pet.getRuntime(), window.petAPI.updates.status(), window.petAPI.activityRules.list()
+    [this.settings, this.stats, this.runtime, this.updateStatus, this.activityRules, this.plans] = await Promise.all([
+      window.petAPI.settings.get(), window.petAPI.statistics.get(31), window.petAPI.pet.getRuntime(), window.petAPI.updates.status(), window.petAPI.activityRules.list(), window.petAPI.plans.list()
     ]);
-    this.onboardingOpen = !this.settings.firstRunConsent;
+    const onboardingReason = onboardingDisplayReason(this.settings, this.updateStatus.currentVersion);
+    this.onboardingOpen = onboardingReason !== null;
+    // 新版本指引每个已安装版本只主动展示一次。打开时立即记账，避免用户直接
+    // 关闭整个窗口后，下次启动又被误判为“尚未展示”。首次安装仍需完成配置。
+    if (onboardingReason === "version-update") {
+      this.settings.onboardingLastShownVersion = this.updateStatus.currentVersion;
+      this.settings = await window.petAPI.settings.update(this.settings);
+    }
+    this.onboardingSuppressFuture = this.settings.suppressOnboardingAfterUpdates;
     this.activity = this.runtime.activity;
     const requestedTab = await window.petAPI.console.initialTab();
     if (tabs.some(([id]) => id === requestedTab)) this.active = requestedTab;
@@ -72,6 +87,8 @@ class ConsoleApp {
     // the last requested page (for example, the update notification page).
     if (this.onboardingOpen) this.active = "home";
     this.render();
+    window.petAPI.windowControls.onMaximizedChanged((maximized) => { document.documentElement.classList.toggle("window-maximized", maximized); window.requestAnimationFrame(() => this.syncOnboardingGeometry()); });
+    installUpdateModal();
     window.petAPI.console.onNavigate((tab) => { if (tabs.some(([id]) => id === tab) && tab !== this.active) void this.openTab(tab); });
     window.petAPI.pet.onActivity((snapshot) => {
       this.activity = snapshot;
@@ -108,11 +125,15 @@ class ConsoleApp {
       if(this.active==='updates')this.syncUpdatePanel();
       else this.syncUpdateAttention();
     });
+    // Plan commands update the affected row in place. Replacing the whole
+    // console here caused a visible flash (and a second render after IPC).
+    window.petAPI.plans.onChanged((plans) => { this.plans = plans; });
     document.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : null;
-      if (!target?.closest(".custom-select, .time-picker, .color-picker")) this.closePopovers();
+      if (!target?.closest(".custom-select, .time-picker, .color-picker, .plan-date-picker")) this.closePopovers();
     });
     document.addEventListener("keydown", (event) => { if (event.key === "Escape") this.closePopovers(); });
+    window.addEventListener("resize", () => this.syncOnboardingGeometry());
   }
 
   private render(preserveScroll=false): void {
@@ -122,7 +143,7 @@ class ConsoleApp {
     const accent = safeAccent(this.settings.appearance.accentColor);
     const name = this.petName();
     const updateAttention=this.updateStatus.phase==='available'||this.updateStatus.phase==='downloaded';
-    this.root.innerHTML = `<div class="console-shell theme-${this.settings.appearance.theme} ${this.settings.manualMode==='energy_saving'?'energy-saving':''}" style="--accent:${accent}">
+    this.root.innerHTML = `<div class="app-window console-window theme-${this.settings.appearance.theme}" style="--accent:${accent}"><div class="window-titlebar"><span class="window-title"><img src="${appIconUrl}" alt="">${name}桌宠控制台</span><div class="window-controls"><button type="button" data-window-minimize aria-label="最小化"></button><button type="button" data-window-maximize aria-label="最大化"></button><button type="button" data-window-close aria-label="关闭"></button></div></div><div class="console-modal-scrim" data-console-modal-scrim hidden></div><div class="console-shell theme-${this.settings.appearance.theme} ${this.settings.manualMode==='energy_saving'?'energy-saving':''}" style="--accent:${accent}">
       <aside class="sidebar" aria-label="控制台主导航">
         <div class="brand"><div class="brand-mark" aria-hidden="true">${this.petNameInitial()}</div><div class="brand-copy"><b>${name}控制台</b><small>${icon('heart')} AI 桌面陪伴</small></div></div>
         <nav>${tabs.map(([id,label,iconName])=>`<button type="button" data-tab="${id}" class="nav-item ${this.active===id?'active':''}" ${this.active===id?'aria-current="page"':''}>${icon(iconName)}<span>${label}</span>${id==='updates'&&updateAttention?'<i class="nav-update-dot" aria-label="有可用更新"></i>':''}${icon('chevron','nav-chevron')}</button>`).join("")}</nav>
@@ -138,15 +159,16 @@ class ConsoleApp {
       <div class="toast" role="status" aria-live="polite"><span class="toast-icon">${icon('check')}</span><span class="toast-message"></span></div>
       <dialog class="confirm-dialog"><form method="dialog"><div class="dialog-icon">${icon('shield')}</div><h2></h2><p></p><div class="dialog-actions"><button type="submit" value="cancel">取消</button><button type="submit" value="confirm" class="danger confirm-submit">确认</button></div></form></dialog>
       ${this.onboarding()}
-    </div>`;
+    </div></div>`;
     this.bind();
     this.updateLiveValues();
     this.syncManualCountdown();
     if(this.active==='home')this.startShowcaseAnimation();
     if(preserveScroll){const workspace=this.root.querySelector<HTMLElement>('.workspace');if(workspace)workspace.scrollTop=previousScroll}
+    if(this.onboardingOpen){const from=this.onboardingTransitionFrom;this.onboardingTransitionFrom=null;window.requestAnimationFrame(()=>this.syncOnboardingGeometry(from));this.onboardingHasEntered=true}
   }
 
-  private subtitle(): string { const name=this.petName(); return ({home:"今天也在安静地陪你工作。",appearance:"调整名字、尺寸、动效和界面风格。",states:`查看并临时切换${name}的状态。`,privacy:`决定${name}能够感知哪些本地上下文。`,reminders:"配置专注、休息和喝水节奏。",ai:"配置智能对话与本地工具权限。",stats:"只展示本地聚合数据，不保存内容。",storage:"管理数据位置与本地数据清理。",updates:"查看版本、隐私说明、使用指引与官方发布页。"} as Record<string,string>)[this.active] ?? ""; }
+  private subtitle(): string { const name=this.petName(); return ({home:"今天也在安静地陪你工作。",appearance:"调整名字、尺寸、动效和界面风格。",states:`查看并临时切换${name}的状态。`,privacy:`决定${name}能够感知哪些本地上下文，并管理本地数据。`,reminders:"配置专注、休息和喝水节奏。",plans:"集中管理单次与循环提醒，按时完成每一件事。",ai:"配置智能对话与本地工具权限。",stats:"只展示本地聚合数据，不保存内容。",updates:"查看版本、隐私说明、使用指引与官方发布页。"} as Record<string,string>)[this.active] ?? ""; }
 
   private page(): string {
     if (this.active === "home") return this.home();
@@ -154,9 +176,9 @@ class ConsoleApp {
     if (this.active === "states") return this.statesV2();
     if (this.active === "privacy") return this.privacy();
     if (this.active === "reminders") return this.reminders();
+    if (this.active === "plans") return this.plansPageV2();
     if (this.active === "ai") return this.ai();
     if (this.active === "stats") return this.statistics();
-    if (this.active === "storage") return this.storage();
     return this.updatesPage();
   }
 
@@ -167,11 +189,11 @@ class ConsoleApp {
     const aiUsed=this.monthlyAiUsage(),aiLimit=Math.max(0,this.settings.ai.monthlyLimit),aiRemaining=Math.max(0,aiLimit-aiUsed);
     const quickModes: ReadonlyArray<readonly [Settings['manualMode'], string, string, IconName]> = [
       ['auto', '自动陪伴', '自动识别节奏', 'sparkles'], ['dnd', '勿扰', '安静陪伴', 'moon'],
-      ['rest', '休息', '进入休息动作', 'coffee'], ['energy_saving', '节能模式', '暂停感知并降低动效开销', 'activity']
+      ['rest', '休息', '进入休息动作', 'coffee'], ['energy_saving', '节能模式', '暂停感知和动画', 'activity']
     ];
     const quickModeCards = quickModes.map(([value, label, description, iconName]) => `<button type="button" data-mode="${value}" class="quick-mode-card ${this.settings.manualMode===value?'selected':''}"><i class="quick-mode-icon">${icon(iconName)}</i><span><b>${label}</b><small>${description}</small></span>${this.settings.manualMode===value?`<em>${icon('check')} 当前</em>`:''}</button>`).join('');
     return `<article class="hero-card"><div class="hero-copy"><span class="status-pill"><i class="status-dot ${this.sensingActive()?'':'off'}"></i>当前状态 · <b data-live="sensor-source">${this.sensorSourceName()}</b></span><h2 data-live="mode-headline">${this.modeHeadline()}</h2><p><span data-live="foreground">${escapeHtml(this.foregroundLabel())}</span><span class="hero-separator">·</span><span data-live="typing">${this.typingLabel()}</span></p><div class="hero-actions"><button type="button" data-command="chat" class="primary">${buttonLabel('message','立即聊天')}</button><button type="button" data-command="toggle-sensing" class="sensing-toggle">${this.sensingControlLabel()}</button></div></div><div class="pet-showcase"><div class="pet-orb"><span class="orb-ring"></span><img data-showcase-pet src="./sprites/idle_breath/idle_breath_000.png" alt="${name}"></div><span class="companion-badge">${icon('heart')} <span data-live="mode-label">${this.modeLabel()}</span></span></div></article>
-      <div class="metric-grid">${this.metric('clock','今日生产力时间',this.duration(today?.productiveSeconds ?? 0),'生产力组细分活动')}${this.metric('keyboard','输入事件',`${this.compactCount(today?.inputEvents ?? 0)} 次`,'键盘、点击与滚轮次数')}${this.metric('coffee','休息完成',`${this.compactCount(today?.breaksCompleted ?? 0)} 次`,'今天的完成次数')}${this.metric('brain','AI 对话',`${this.compactCount(aiUsed)} 次`,`限额 ${this.compactCount(aiLimit)} 次 · 剩余 ${this.compactCount(aiRemaining)} 次`)}</div>
+      <div class="metric-grid home-metric-grid">${this.metric('clock','今日生产力时间',this.duration(today?.productiveSeconds ?? 0),'生产力组细分活动')}${this.metric('keyboard','输入事件',`${this.compactCount(today?.inputEvents ?? 0)} 次`,'键盘、点击与滚轮次数')}${this.wellbeingCard()}${this.metric('brain','AI 对话',`${this.compactCount(aiUsed)} 次`,`限额 ${this.compactCount(aiLimit)} 次 · 剩余 ${this.compactCount(aiRemaining)} 次`)}</div>
       <div class="two-col"><article class="card">${sectionHeading('感知健康','只统计活动信号，不读取输入内容')}<div class="health-list"><div class="health-row"><span>感知状态</span><b class="status-text ${this.sensingActive()?'ok':'warn'}" data-live="sensing-status">${this.sensingLabel()}</b></div><div class="health-row"><span>键盘事件（最近 1 秒）</span><b data-live="keyboard-rate">${this.activity.keyboardCount1s}</b></div><div class="health-row"><span>鼠标事件（最近 1 秒）</span><b data-live="mouse-rate">${this.activity.mouseClicks1s + this.activity.mouseWheel1s}</b></div><div class="health-row"><span>内容上下文</span><b>${this.settings.sensing.autoContext?'自动附带':'不发送'}</b></div></div></article><article class="card">${sectionHeading('电脑与桌宠性能','桌宠应用占用信息，关闭控制台会释放其渲染进程')}<div class="health-list"><div class="health-row"><span>系统 CPU / 内存</span><b><span data-live="system-cpu">${this.percent(performance.systemCpuPercent)}</span> / <span data-live="system-memory">${this.percent(performance.systemMemoryPercent)}</span></b></div><div class="health-row"><span>应用 CPU / 内存</span><b><span data-live="pet-cpu">${this.percent(performance.petCpuPercent)}</span> / <span data-live="pet-memory">${performance.petMemoryMb.toFixed(1)} MB</span></b></div><div class="health-row"><span>传感器内存</span><b data-live="sensor-memory">${performance.sensorMemoryMb ? `${performance.sensorMemoryMb.toFixed(1)} MB` : '基础降级层'}</b></div><div class="health-row"><span>进程 / 事件循环延迟</span><b><span data-live="pet-processes">${performance.petProcessCount}</span> / <span data-live="event-loop-lag">${performance.eventLoopLagMs} ms</span></b></div></div></article></div><article class="card compact-card quick-mode-section">${sectionHeading('快速模式',`一键切换${name}的陪伴节奏`)}<div class="quick-mode-grid">${quickModeCards}</div></article>`;
   }
 
@@ -180,7 +202,7 @@ class ConsoleApp {
     const resetBehavior=`<button type="button" data-command="reset-behavior" class="section-reset">${buttonLabel('rotate','重置')}</button>`;
     const resetMotion=`<button type="button" data-command="reset-motion" class="section-reset">${buttonLabel('rotate','重置')}</button>`;
     const resetAccent=`<button type="button" data-command="reset-accent" class="section-reset">${buttonLabel('rotate','重置强调色')}</button>`;
-    return `<article class="card identity-card"><div class="name-preview"><div class="name-preview-mark">${this.petNameInitial()}</div><span class="name-preview-status">${icon('heart')} 我的桌面伙伴</span></div><div class="name-settings">${sectionHeading('桌宠名字','默认叫珊珊，修改后会同步到聊天、通知、托盘和智能体')}<label class="field-group"><span class="field-label">名字</span><div class="name-input-row"><input type="text" data-pet-name value="${name}" maxlength="12" placeholder="例如：珊珊" autocomplete="off"><button type="button" data-command="save-name" class="primary">${buttonLabel('check','保存名字')}</button></div><small class="field-hint">1–12 个字符，不可为空</small></label></div></article><div class="two-col"><article class="card form-card">${sectionHeading('桌宠尺寸与行为',`调整${name}在桌面上的呈现方式`,resetBehavior)}${this.range("桌宠大小","scale",a.scale,.6,1.5,.01,`${Math.round(a.scale*100)}%`)}${this.switcher("始终置顶","alwaysOnTop",a.alwaysOnTop,`让${name}保持在其他窗口上方`)}${this.switcher("锁定位置","lockPosition",a.lockPosition,"防止误拖动")}<button type="button" data-command="reset-position" class="secondary full">${buttonLabel('rotate','重置到屏幕右下角')}</button></article>
+    return `<article class="card identity-card"><div class="name-preview"><div class="name-preview-mark">${this.petNameInitial()}</div><span class="name-preview-status">${icon('heart')} 我的桌面伙伴</span></div><div class="name-settings">${sectionHeading('桌宠名字','默认叫珊珊，修改后会同步到聊天、通知、托盘和智能体')}<label class="field-group"><span class="field-label">名字</span><div class="name-input-row"><input type="text" data-pet-name value="${name}" maxlength="12" placeholder="例如：珊珊" autocomplete="off"><button type="button" data-command="save-name" class="primary">${buttonLabel('check','保存名字')}</button></div><small class="field-hint">1–12 个字符，不可为空</small></label></div></article><div class="two-col equal-card-pair appearance-card-pair"><article class="card form-card">${sectionHeading('桌宠尺寸与行为',`调整${name}在桌面上的呈现方式`,resetBehavior)}${this.range("桌宠大小","scale",a.scale,.6,1.5,.01,`${Math.round(a.scale*100)}%`)}${this.switcher("始终置顶","alwaysOnTop",a.alwaysOnTop,`让${name}保持在其他窗口上方`)}${this.switcher("锁定位置","lockPosition",a.lockPosition,"防止误拖动")}<button type="button" data-command="reset-position" class="secondary full">${buttonLabel('rotate','重置到屏幕右下角')}</button></article>
       <article class="card form-card">${sectionHeading('动效与气泡','气泡框与文字统一缩放；鼠标滚轮会与人物一起联动',resetMotion)}${this.select("动画强度","animationIntensity",a.animationIntensity,[["full","完整"],["soft","柔和"],["minimal","极简"]])}${this.range("气泡与文字大小","bubbleScale",a.bubbleScale,.8,1.3,.01,`${Math.round(a.bubbleScale*100)}%`)}${this.range("气泡透明度","bubbleOpacity",a.bubbleOpacity,.72,1,.02,`${Math.round(a.bubbleOpacity*100)}%`)}${this.range("气泡时长","bubbleDurationSeconds",a.bubbleDurationSeconds,3,20,1,`${a.bubbleDurationSeconds} 秒`)}</article></div>
       <article class="card">${sectionHeading('控制台风格','主题与强调色会实时应用到整个控制台',resetAccent)}<div class="theme-grid">${[["cream","柔光暖白","sun","#fff8fb"],["dark","暮色深灰","moon",safeAccent(a.accentColor)],["system","跟随系统","monitor",`linear-gradient(135deg,#fff8fb 50%,${safeAccent(a.accentColor)} 50%)`]].map(([v,l,iconName,c])=>`<button type="button" data-theme="${v}" class="theme-swatch ${a.theme===v?'selected':''}"><i class="theme-preview" style="background:${c}">${icon(iconName as IconName)}</i><span><b>${l}</b><small>${v==='system'?'随 Windows 外观切换':v==='dark'?'夜间更柔和':'与当前粉白界面一致'}</small></span>${a.theme===v?icon('check','selected-check'):''}</button>`).join('')}</div>${this.colorPicker()}</article>`;
   }
@@ -193,7 +215,7 @@ class ConsoleApp {
     const summary = (state: PetState) => stateActionMap[state].map((id) => definitions.get(id)?.name ?? id).join(" / ");
     const modes: Array<[Settings["manualMode"], string, string]> = [
       ["auto", "自动", "自动识别切换"], ["dnd", "勿扰", "只安静陪伴"], ["rest", "休息", "进入休息动作"],
-      ["low_battery", "低电量", "模拟低电量状态"], ["energy_saving", "节能", "暂停感知并降低动画开销"], ["manual", "临时状态", this.manualCountdownLabel()]
+      ["low_battery", "低电量", "模拟低电量状态"], ["energy_saving", "节能", "暂停感知和动画"], ["manual", "临时状态", this.manualCountdownLabel()]
     ];
     const directionalDragPreviews = [
       ["dragged_left", "向左拖拽（镜像）", "拖到左侧时自动切换"],
@@ -211,10 +233,10 @@ class ConsoleApp {
     const name=this.petName();
     const rows:Array<[keyof typeof s,string,string]>=[['foregroundApp','前台应用','识别当前应用类别与持续时间'],['windowTitle','窗口与文档标题','仅在内存中使用'],['keyboardMouse','键鼠活动频率','绝不保存键值或文本'],['clipboard','剪贴板文本','仅随主动 AI 请求读取'],['selectedText','当前选中文本','通过 UI Automation 尝试读取，不模拟复制'],['meeting','会议状态','识别会议应用并静默'],['microphone','麦克风占用','只判断是否占用，不录音'],['power','电源和电量','低电量时切换状态'],['network','网络状态','断网时使用本地回复']];
     return `${!this.settings.firstRunConsent?`<article class="consent"><div class="consent-icon">${icon('shield')}</div><div><span class="eyebrow">隐私优先</span><h2>在启用内容感知前，请确认</h2><p>${name}不会记录具体按键、不会录音、不会截图。窗口标题、选中文本与剪贴板不会写入磁盘，只在你主动对话时按设置发送。</p></div><button type="button" data-command="consent" class="primary">${buttonLabel('check','我了解并同意启用')}</button></article>`:''}
-      <div class="two-col"><article class="card form-card">${sectionHeading('总开关','随时暂停或完全关闭本地感知')}${this.switcher("本地感知","enabled",s.enabled,"关闭后只保留基本动画和手动聊天",'sensing')}${this.switcher("自动附带当前上下文","autoContext",s.autoContext,"每次主动对话前展示并脱敏",'sensing')}${this.switcher("智能学习未知软件","smartActivityLearning",s.smartActivityLearning,"未知场景稳定 8 秒后才允许 AI 判断，并在本机复用",'sensing')}<div class="button-cluster"><button type="button" data-command="pause-10">暂停 10 分钟</button><button type="button" data-command="pause-tomorrow">暂停到明天</button><button type="button" data-command="disable-sensing" class="danger-text">完全关闭</button></div></article>
+      <div class="two-col equal-card-pair privacy-primary-pair"><article class="card form-card">${sectionHeading('总开关','随时暂停或完全关闭本地感知')}${this.switcher("本地感知","enabled",s.enabled,"关闭后只保留基本动画和手动聊天",'sensing')}${this.switcher("自动附带当前上下文","autoContext",s.autoContext,"每次主动对话前展示并脱敏",'sensing')}${this.switcher("智能学习未知软件","smartActivityLearning",s.smartActivityLearning,"未知场景稳定 8 秒后才允许 AI 判断，并在本机复用",'sensing')}<div class="button-cluster"><button type="button" data-command="pause-10">暂停 10 分钟</button><button type="button" data-command="pause-tomorrow">暂停到明天</button><button type="button" data-command="disable-sensing" class="danger-text">完全关闭</button></div></article>
       <article class="card">${sectionHeading('实时感知诊断','数据随系统活动实时更新')}<div class="health-list"><div class="health-row"><span>数据来源</span><b data-live="sensor-source">${this.sensorSourceName()}</b></div><div class="health-row"><span>前台应用</span><b class="truncate" data-live="foreground">${escapeHtml(this.foregroundLabel())}</b></div><div class="health-row"><span>键盘（1 秒 / 10 秒）</span><b><span data-live="keyboard-rate">${this.activity.keyboardCount1s}</span> / <span data-live="keyboard-10s">${this.activity.keyboardCount10s}</span></b></div><div class="health-row"><span>鼠标点击与滚轮（1 秒）</span><b data-live="mouse-rate">${this.activity.mouseClicks1s + this.activity.mouseWheel1s}</b></div><div class="health-row"><span>系统空闲</span><b data-live="idle-seconds">${this.activity.idleSeconds} 秒</b></div></div><p class="diagnostic-note">${icon('lock')}这里只展示次数和结构化状态。传感器不会读取键码、按键内容、音频或屏幕图像。</p></article></div>
       <article class="card">${sectionHeading('感知项目',`逐项决定${name}能够读取的结构化状态`)}<div class="permission-list">${rows.map(([k,l,d])=>this.switcher(l,k,Boolean(s[k]),d,'sensing')).join('')}</div></article>
-      <div class="two-col"><article class="card form-card">${sectionHeading('内容黑名单','命中关键词时不读取上下文')}<textarea class="blacklist-input" data-list="blockedApps" placeholder="每行一个应用或标题关键词" aria-label="内容黑名单" spellcheck="false" autocapitalize="off">${escapeHtml(s.blockedApps.join('\n'))}</textarea></article><article class="card">${sectionHeading('上下文预览','发送给 AI 前可随时核对')}<pre class="context-preview">点击刷新查看当前将发送给 AI 的内容</pre><button type="button" data-command="context-preview" class="secondary full">${buttonLabel('eye','刷新预览')}</button></article></div>${this.activityRulesCard()}`;
+      <div class="two-col equal-card-pair privacy-content-pair"><article class="card form-card">${sectionHeading('内容黑名单','命中关键词时不读取上下文')}<textarea class="blacklist-input" data-list="blockedApps" placeholder="每行一个应用或标题关键词" aria-label="内容黑名单" spellcheck="false" autocapitalize="off">${escapeHtml(s.blockedApps.join('\n'))}</textarea></article><article class="card context-preview-card">${sectionHeading('上下文预览','发送给 AI 前可随时核对')}<pre class="context-preview">点击刷新查看当前将发送给 AI 的内容</pre><button type="button" data-command="context-preview" class="secondary full">${buttonLabel('eye','刷新预览')}</button></article></div>${this.activityRulesCard()}${this.storage()}`;
   }
 
   private activityRulesCard(): string {
@@ -230,6 +252,43 @@ class ConsoleApp {
     return `<article class="card chat-entry-card"><div class="chat-entry-copy">${icon('message')}<span><b>智能体聊天台</b><small>有问题或需要帮忙时，随时来和${escapeHtml(this.petName())}聊聊</small></span></div><button type="button" data-command="chat" class="primary">${buttonLabel('message','打开聊天台')}</button></article><div class="two-col"><article class="card form-card ai-config-card">${sectionHeading('DeepSeek API 配置','配置 API Key 后才可使用在线智能对话')}<label><span class="field-label">DeepSeek API 地址</span><div class="locked-url-row"><input data-base-url readonly value="${escapeHtml(a.baseUrl)}" spellcheck="false" aria-label="DeepSeek API 地址"><button type="button" data-command="edit-base-url" class="field-edit-button" aria-label="编辑 DeepSeek API 地址" title="编辑 API 地址">${buttonLabel('edit','编辑')}</button></div><small class="field-help">默认使用 DeepSeek 官方接口。为防止误触，只有点击“编辑”后才能修改。</small></label>${this.select("模型","model",a.model,[["deepseek-v4-flash","V4 Flash · 快速"],["deepseek-v4-pro","V4 Pro · 高质量"]],"ai")}<label><span class="field-label">API Key</span><div class="secret-row"><input type="password" class="api-key" placeholder="输入 DeepSeek API Key 后安全保存" autocomplete="off"><button type="button" data-command="save-key" class="secondary">${buttonLabel('key','安全保存')}</button></div></label>${this.number("月度调用上限","monthlyLimit",a.monthlyLimit,"次",'ai')}<button type="button" data-command="test-ai" class="primary full">${buttonLabel('activity','测试连接')}</button><p class="connection-result inline-result" aria-live="polite"></p></article><article class="card form-card">${sectionHeading('对话与问候','控制推理、上下文和桌面气泡文案')}${this.switcher("AI 智能问候文案","smartCompanionSpeech",a.smartCompanionSpeech,"开启且 API 可用时批量生成临时、不重复的点击与主动问候；否则使用内置文案",'ai')}${this.switcher("深度思考","deepThinking",a.deepThinking,"复杂任务使用更强推理",'ai')}${this.switcher("自动附带当前上下文","includeContext",a.includeContext,"遵循感知页的黑名单和脱敏规则",'ai')}<div class="ai-quota"><div>${icon('brain')}<span><b>本月调用上限</b><small>已用 ${this.compactCount(used)} 次 · 剩余 ${this.compactCount(remaining)} 次</small></span></div><strong>${this.compactCount(a.monthlyLimit)} 次</strong></div><button type="button" data-command="clear-chats" class="danger-text full">${buttonLabel('trash','清空本地聊天历史')}</button></article></div><article class="card permission-card">${sectionHeading('工具权限','每项下拉框直接控制对应工具的执行方式')}<div class="permission-explainer">${icon('shield')}<div><b>三个权限都会在执行层实时生效</b><p>“每次询问”会对每一次真实工具调用弹出确认；“直接允许”跳过确认；“禁止使用”会直接拒绝。聊天台中的快速授权也会立即同步到这里。</p></div></div><div class="permission-controls">${this.permissionControl('打开网页','open_url',a.toolPermissions.open_url,'使用临时浏览器查询，结束后自动关闭并返回结果')}${this.permissionControl('启动应用','launch_app',a.toolPermissions.launch_app,'仅支持记事本、计算器、画图、资源管理器和系统设置')}${this.permissionControl('读取当前上下文','read_current_context',a.toolPermissions.read_current_context,'仅返回已脱敏的临时上下文')}</div><div class="fixed-policy"><b>固定安全策略</b><p><span><i class="permission-dot safe"></i>提醒、动作、通知和打开控制台可直接执行</span><span><i class="permission-dot never"></i>Shell、任意命令、文件写入与删除永不开放</span></p></div></article>`;
   }
 
+  private planSelect(key:string,value:string,label:string,options:Array<[string,string]>):string {
+    return `<div class="custom-select plan-select"><input type="hidden" data-plan-${key} value="${escapeHtml(value)}"><button type="button" class="custom-select-trigger" data-plan-select-trigger="${key}" aria-haspopup="listbox" aria-expanded="false"><span>${escapeHtml(label)}</span>${icon('chevron')}</button><div class="custom-select-menu popover-panel" role="listbox" hidden>${options.map(([optionValue,optionLabel])=>`<button type="button" class="custom-select-option${optionValue===value?' selected':''}" role="option" aria-selected="${optionValue===value}" data-plan-select-value="${escapeHtml(optionValue)}" data-plan-select-key="${key}"><span>${escapeHtml(optionLabel)}</span>${optionValue===value?icon('check'):''}</button>`).join('')}</div></div>`;
+  }
+
+  private planCalendarDays(year:number,month:number,selectedDate:string):string{
+    const first=new Date(year,month,1),offset=(first.getDay()+6)%7;
+    const format=(date:Date)=>`${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`,todayKey=format(new Date());
+    return Array.from({length:42},(_,index)=>{
+      const date=new Date(year,month,index-offset+1),key=format(date),outside=date.getMonth()!==month,past=key<todayKey;
+      return `<button type="button" class="plan-calendar-day${outside?' outside':''}${key===selectedDate?' selected':''}${key===todayKey?' today':''}" data-plan-calendar-day="${key}" ${past?'disabled':''}><span>${date.getDate()}</span></button>`;
+    }).join('');
+  }
+
+  private planDateTimePicker(dateValue:string,clockValue:string):string{
+    const selected=new Date(`${dateValue}T12:00:00`),year=selected.getFullYear(),month=selected.getMonth(),[hour,minute]=clockValue.split(':');
+    const hours=Array.from({length:24},(_,value)=>String(value).padStart(2,'0')),minutes=Array.from({length:60},(_,value)=>String(value).padStart(2,'0'));
+    return `<div class="plan-date-picker" data-plan-date-picker data-view-year="${year}" data-view-month="${month}"><input type="hidden" data-plan-date value="${dateValue}"><input type="hidden" data-plan-hour value="${hour}"><input type="hidden" data-plan-minute value="${minute}"><button type="button" class="plan-datetime-trigger" data-plan-datetime-trigger aria-haspopup="dialog" aria-expanded="false">${icon('clock')}<span data-plan-datetime-label>${selected.toLocaleDateString('zh-CN',{month:'long',day:'numeric',weekday:'short'})} · ${clockValue}</span>${icon('chevron')}</button><div class="plan-datetime-panel popover-panel" hidden><div class="plan-calendar"><header><button type="button" data-plan-month-step="-1" aria-label="上个月">‹</button><b data-plan-month-label>${year}年${month+1}月</b><button type="button" data-plan-month-step="1" aria-label="下个月">›</button></header><div class="plan-weekdays"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div><div class="plan-calendar-grid" data-plan-calendar-grid>${this.planCalendarDays(year,month,dateValue)}</div><div class="plan-calendar-shortcuts"><button type="button" data-plan-date-shortcut="today">今天</button><button type="button" data-plan-date-shortcut="tomorrow">明天</button></div></div><div class="plan-time-wheel"><div class="plan-time-head"><span>执行时间</span><b data-plan-time-preview>${clockValue}</b></div><div class="plan-time-columns"><div class="plan-time-column" aria-label="小时">${hours.map(value=>`<button type="button" data-plan-time-part="hour" data-plan-time-value="${value}" class="${value===hour?'selected':''}">${value}</button>`).join('')}</div><i>:</i><div class="plan-time-column" aria-label="分钟">${minutes.map(value=>`<button type="button" data-plan-time-part="minute" data-plan-time-value="${value}" class="${value===minute?'selected':''}">${value}</button>`).join('')}</div></div><button type="button" class="primary" data-plan-datetime-apply>确定时间</button></div></div></div>`;
+  }
+
+  private plansPageV2():string{
+    const plans=this.plans,now=new Date(),pad=(value:number)=>String(value).padStart(2,'0');now.setSeconds(0,0);now.setMinutes(now.getMinutes()+1);
+    const defaultDate=`${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`,defaultClock=`${pad(now.getHours())}:${pad(now.getMinutes())}`;
+    const active=plans.tasks.filter(item=>item.status==='active').sort((a,b)=>(a.nextDueAt??Infinity)-(b.nextDueAt??Infinity));
+    const completedHistory=plans.occurrences.filter(item=>item.status==='completed').sort((a,b)=>(b.completedAt??b.createdAt)-(a.completedAt??a.createdAt)).flatMap(occurrence=>{const task=plans.tasks.find(item=>item.id===occurrence.taskId);return task?[{task,completedAt:occurrence.completedAt??occurrence.createdAt}]:[]}),completedPlans=completedHistory.slice(0,6);
+    const todayKey=new Date().toLocaleDateString('sv-SE'),isToday=(value:number|null)=>Boolean(value&&new Date(value).toLocaleDateString('sv-SE')===todayKey);
+    const recurrenceLabel=(kind:string)=>({once:'单次',daily:'每天',weekly:'每周','monthly-date':'每月','monthly-last-day':'每月最后一天'} as Record<string,string>)[kind]??kind;
+    const dateLabel=(value:number|null)=>value?new Date(value).toLocaleString('zh-CN',{month:'long',day:'numeric',weekday:'short',hour:'2-digit',minute:'2-digit',hour12:false}):'未排期';
+    const completedToday=(taskId:string)=>plans.occurrences.filter(item=>item.taskId===taskId&&item.status==='completed'&&isToday(item.completedAt??item.createdAt)).sort((a,b)=>(b.completedAt??b.createdAt)-(a.completedAt??a.createdAt))[0];
+    const taskRows=active.map(task=>{const latest=completedToday(task.id),scope=isToday(task.nextDueAt)?'today':'upcoming',status=latest?`<em class="plan-occurrence-status">${escapeHtml(new Date(latest.completedAt??latest.createdAt).toLocaleDateString('zh-CN',{month:'long',day:'numeric'}))} 已完成</em>`:'';return `<article class="plan-task-card${latest?' completed-today':''}" data-plan-task-scope="${scope}"><div class="plan-task-check"><span class="plan-priority ${task.priority}"></span></div><div class="plan-task-copy"><div class="plan-task-title"><b>${escapeHtml(task.title)}</b>${status}</div><div class="plan-task-notes">${escapeHtml(task.notes || '还没有填写具体内容')}</div><p>${escapeHtml(dateLabel(task.nextDueAt))}<span>·</span>${escapeHtml(recurrenceLabel(task.recurrence.kind))}</p></div><div class="plan-task-actions"><button type="button" data-plan-edit="${escapeHtml(task.id)}" class="plan-edit">${icon('edit')}编辑</button><button type="button" data-plan-complete="${escapeHtml(task.id)}" class="plan-complete" ${latest?'disabled title="本次已完成，下一次会按重复规则提醒"':''}>${latest?'本次已完成':'完成'}</button><button type="button" data-plan-delete="${escapeHtml(task.id)}" class="plan-more" aria-label="删除计划" title="删除计划">${icon('trash')}</button></div></article>`;}).join('')||'<div class="plan-empty"><b>暂时没有进行中的计划</b><span>点击右上角“新建计划”，或让智能体生成计划草案。</span></div>';
+    const unread=plans.inbox.filter(item=>!item.read);
+    const inbox=unread.slice(-5).reverse().map(item=>`<article class="inbox-row"><div class="inbox-row-main"><button type="button" class="inbox-check" data-plan-inbox-complete="${escapeHtml(item.id)}" aria-label="完成 ${escapeHtml(item.title)}" title="完成此提醒"><span>${icon('check')}</span></button><span class="inbox-copy"><span class="inbox-kicker">待处理提醒</span><b>${escapeHtml(item.title)}</b><small>${icon('clock')}${escapeHtml(dateLabel(item.dueAt))}</small></span></div><button type="button" class="inbox-snooze" data-plan-inbox-snooze="${escapeHtml(item.id)}">10 分钟后提醒</button></article>`).join('')||'<div class="plan-empty compact"><b>没有待处理提醒</b><span>勿扰、全屏或错过的提醒会自动保存在这里。</span></div>';
+    const completedRows=completedPlans.map(({task,completedAt})=>`<div class="plan-completed-row"><span class="plan-completed-check">${icon('check')}</span><span><b>${escapeHtml(task.title)}</b><small>${escapeHtml(new Date(completedAt).toLocaleString('zh-CN',{month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}))}<em class="plan-completed-recurrence">${escapeHtml(recurrenceLabel(task.recurrence.kind))}</em></small></span><button type="button" class="plan-reuse" data-plan-reuse="${escapeHtml(task.id)}" aria-label="引用此完成记录新建计划" title="引用此记录新建计划">${icon('copy')}</button></div>`).join('')||'<div class="plan-empty compact"><b>还没有完成记录</b><span>完成计划后会显示在这里。</span></div>';
+    const todayCount=active.filter(task=>isToday(task.nextDueAt)).length,upcomingCount=active.length-todayCount;
+    return `<section class="plan-hub"><article class="plan-hero"><div><span class="eyebrow">清晰安排，按时提醒</span><h2>我的计划</h2><p>新建计划会自动带入当前时间，你只需要填写要提醒的事情。</p></div><div class="plan-hero-stats"><span><b>${todayCount}</b><small>今天</small></span><span><b>${upcomingCount}</b><small>即将到来</small></span><span><b>${completedHistory.length}</b><small>最近完成</small></span></div><button type="button" class="primary plan-new-button" data-plan-new>${icon('edit')}新建计划</button></article><div class="plan-dashboard"><article class="card plan-board"><header class="plan-board-header"><div>${sectionHeading('计划清单',`进行中 ${active.length} 项`)}</div><div class="plan-filter" role="tablist"><button type="button" class="selected" data-plan-filter="all">全部 ${active.length}</button><button type="button" data-plan-filter="today" ${todayCount?'':'disabled'}>今天 ${todayCount}</button><button type="button" data-plan-filter="upcoming" ${upcomingCount?'':'disabled'}>即将到来 ${upcomingCount}</button></div></header><div class="plan-task-list">${taskRows}</div></article><aside class="plan-rail"><article class="card plan-completed-card"><header><div><span class="eyebrow">完成记录</span><h3>最近已完成</h3></div><div class="plan-completed-actions"><button type="button" data-plan-clear-history ${completedHistory.length?'':'disabled'}>清空记录</button></div></header><div class="plan-completed-list">${completedRows}</div><p class="plan-history-note">总共 ${completedHistory.length} 条完成记录</p></article><article class="card plan-inbox-card"><header><div><span class="eyebrow">提醒收件箱</span><h3>等待你处理</h3></div><b>${unread.length}</b></header><div class="inbox-list">${inbox}</div></article></aside></div></section>
+      <dialog class="plan-dialog plan-create-dialog" data-plan-create-dialog><form method="dialog"><header><div><span class="eyebrow" data-plan-dialog-kicker>新建计划</span><h2 data-plan-dialog-title>安排一件要提醒的事</h2><p data-plan-dialog-description>写清楚具体要做什么，再选择未来一分钟或更晚的时间。</p></div><button value="cancel" aria-label="关闭">${icon('close')}</button></header><div class="plan-create-body"><input type="hidden" data-plan-edit-id><label class="plan-title-field"><span class="field-label">计划标题</span><input data-plan-title maxlength="120" placeholder="例如：整理本周项目资料" autofocus></label><label><span class="field-label">执行日期与时间</span>${this.planDateTimePicker(defaultDate,defaultClock)}</label><label class="plan-notes-field"><span class="field-label">计划内容</span><textarea data-plan-notes maxlength="2000" placeholder="写下具体要完成的内容、步骤或交付结果"></textarea><small>把“要做什么”写具体，提醒出现时就能直接开始。</small></label><div class="plan-recurrence-field"><span class="field-label">重复规则</span><div class="plan-recurrence-options" role="radiogroup" aria-label="重复规则"><input type="hidden" data-plan-recurrence value="once">${[['once','单次'],['daily','每天'],['weekly','每周'],['monthly-date','每月'],['monthly-last-day','每月末']].map(([value,label])=>`<button type="button" role="radio" aria-checked="${value==='once'}" class="plan-recurrence-option${value==='once'?' selected':''}" data-plan-recurrence-value="${value}">${label}</button>`).join('')}</div></div></div><div class="toast dialog-toast" role="status" aria-live="assertive"><span class="toast-icon">${icon('check')}</span><span class="toast-message"></span></div><footer><button value="cancel">取消</button><button type="button" data-plan-create class="primary"><span data-plan-create-label>创建计划</span></button></footer></form></dialog>`;
+  }
+
   private statistics(): string {
     const days=this.stats?.days??[];
     const max=Math.max(1,...days.map(d=>d.activeSeconds));
@@ -242,14 +301,15 @@ class ConsoleApp {
       return `<div class="category-row"><span class="category-name">${escapeHtml(group.label)}</span><span class="bar-track" tabindex="0"><i style="width:${percent}%"></i><span class="category-tooltip">${this.duration(group.value)} · 占记录时长 ${percent.toFixed(1)}%</span></span><b>${this.duration(group.value)}</b></div>`;
     }).join('');
     return `<article class="card stats-toolbar"><div>${sectionHeading('统计范围','活跃时间按每秒去重；输入事件只累计次数，不保存内容')}</div><div class="range-tabs" role="group" aria-label="统计范围">${[1,3,7,30].map(value=>`<button type="button" data-stats-range="${value}" class="${this.statsRange===value?'selected':''}" aria-pressed="${this.statsRange===value}">${value===1?'今天':`${value} 天`}</button>`).join('')}</div></article>
-      <div class="metric-grid">${this.metric('activity',`${rangeLabel}活跃`,this.duration(total.active),'暂离与休息不累计')}${this.metric('clock',`${rangeLabel}生产力`,this.duration(total.productive),'生产力组 9 个细分状态')}${this.metric('keyboard','输入事件',`${this.compactCount(total.input)} 次`,'键盘、点击与滚轮次数')}${this.metric('refresh','应用切换',`${this.compactCount(total.switches)} 次`,'前台进程变化')}</div>
+      <div class="metric-grid stats-metric-grid">${this.metric('activity',`${rangeLabel}活跃`,this.duration(total.active),'暂离与休息不累计')}${this.metric('clock',`${rangeLabel}生产力`,this.duration(total.productive),'生产力组 9 个细分状态')}${this.metric('keyboard','输入事件',`${this.compactCount(total.input)} 次`,'键盘、点击与滚轮次数')}${this.metric('refresh','应用切换',`${this.compactCount(total.switches)} 次`,'前台进程变化')}</div>
+      ${this.wellbeingStatsStrip()}
       <article class="card chart-card">${sectionHeading(`${rangeLabel}活跃趋势`,'每天的聚合活跃时长；悬浮柱状图查看详情',refreshAction)}<div class="chart-grid-lines" aria-hidden="true"><i></i><i></i><i></i></div><div class="bar-chart ${days.length>14?'dense':''}" role="img" aria-label="${rangeLabel}活跃趋势柱状图">${days.length?days.map(d=>{const height=d.activeSeconds?Math.max(3,d.activeSeconds/max*100):0;return `<div class="chart-column" tabindex="0" style="--bar-height:${height}%"><span class="chart-tooltip"><b>${escapeHtml(d.date)}</b><small>活跃 ${this.duration(d.activeSeconds)}</small><small>生产力 ${this.duration(d.productiveSeconds)} · 输入 ${this.compactCount(d.inputEvents)}</small></span><i></i><small class="chart-date">${escapeHtml(d.date.slice(5))}</small></div>`}).join(''):`<div class="empty-chart">${icon('chart')}<b>暂无统计数据</b><small>使用一段时间后，趋势会显示在这里</small></div>`}</div></article>
       <div class="two-col"><article class="card category-summary">${sectionHeading(`${rangeLabel}活动分类`,'仅按大组汇总；细分状态仍会独立记录')}<div class="category-bars">${groups}</div></article><article class="card">${sectionHeading('陪伴与 AI','本地与在线回复概况')}<div class="health-list"><div class="health-row"><span>本月 AI 调用</span><b>${this.compactCount(this.stats?.monthlyAiCalls??0)} 次</b></div><div class="health-row"><span>本地降级回复</span><b>${this.compactCount(total.local)} 次</b></div><div class="health-row"><span>当前应用识别</span><b>${escapeHtml(`${this.activity.applicationLabel} · ${this.activity.activityLabel}`)}</b></div><div class="health-row"><span>识别来源</span><b>${escapeHtml(this.activity.classificationSource)}</b></div></div></article></div>`;
   }
 
   private storage(): string {
     const currentDirectory=this.settings.dataDirectory;
-    return `<div class="two-col"><article class="card form-card">${sectionHeading('数据位置','管理聚合统计、聊天与本机学习库')}<label><span class="field-label">当前目录</span><div class="read-only-field">${icon('folder')}<input readonly value="${escapeHtml(currentDirectory)}" title="${escapeHtml(currentDirectory)}"></div></label><p class="info-note">${icon('shield')}迁移会复制并校验数据，成功后删除旧目录。每台电脑独立学习，不会自动联网同步。</p><button type="button" data-command="choose-directory" class="primary full">${buttonLabel('folder','选择新的存储文件夹')}</button></article><article class="card">${sectionHeading('数据保留','每日聚合默认保留 90 天')}<p class="storage-summary">本机规则不保存完整路径、窗口标题、文档名或 URL。API Key 使用 Windows DPAPI 加密。下方操作执行前会再次确认。</p><div class="danger-zone"><button type="button" data-command="clear-stats">${buttonLabel('trash','清空统计')}<small>保留独立的本月 API 用量</small></button><button type="button" data-command="clear-chats">${buttonLabel('trash','清空聊天')}<small>删除全部本地聊天记录</small></button><button type="button" data-command="clear-activity-rules">${buttonLabel('trash','清除学习规则')}<small>保留统计、聊天、设置与 API Key</small></button><button type="button" data-command="reset-all" class="danger">${buttonLabel('rotate','恢复全部默认')}<small>删除数据、API Key、授权与所有设置</small></button><button type="button" data-command="clear-all" class="danger">${buttonLabel('trash','清除全部本地数据')}<small>清理安全标记目录并重启应用</small></button></div></article></div>`;
+    return `<div class="two-col"><article class="card form-card">${sectionHeading('数据位置','管理聚合统计、聊天与本机学习库')}<label><span class="field-label">当前目录</span><div class="read-only-field">${icon('folder')}<input readonly value="${escapeHtml(currentDirectory)}" title="${escapeHtml(currentDirectory)}"></div></label><p class="info-note">${icon('shield')}迁移会复制并校验数据，成功后删除旧目录。每台电脑独立学习，不会自动联网同步。</p><button type="button" data-command="choose-directory" class="primary full">${buttonLabel('folder','选择新的存储文件夹')}</button></article><article class="card">${sectionHeading('数据保留','每日聚合默认保留 90 天')}<p class="storage-summary">本机规则不保存完整路径、窗口标题、文档名或 URL。API Key 使用 Windows DPAPI 加密。下方操作执行前会再次确认。</p><div class="danger-zone"><button type="button" data-command="clear-stats">${buttonLabel('trash','清空统计')}<small>保留独立的本月 API 用量</small></button><button type="button" data-command="clear-chats">${buttonLabel('trash','清空聊天')}<small>删除全部本地聊天记录</small></button><button type="button" data-command="reset-all" class="danger">${buttonLabel('rotate','恢复全部默认')}<small>删除数据、API Key、授权与所有设置</small></button><button type="button" data-command="clear-all" class="danger">${buttonLabel('trash','清除全部本地数据')}<small>清理安全标记目录并重启应用</small></button></div></article></div>`;
   }
 
   private updatesPage():string{
@@ -280,7 +340,8 @@ class ConsoleApp {
     if(this.onboardingStep===1)primaryActions='<button type="button" data-command="onboarding-private" class="tour-secondary">暂不开启</button><button type="button" data-command="onboarding-enable" class="tour-primary">同意并开启</button>';
     if(this.onboardingStep===2)primaryActions='<button type="button" data-command="onboarding-ai-later" class="tour-secondary">稍后配置</button><button type="button" data-command="onboarding-open-ai" class="tour-primary">去配置 API Key</button>';
     if(this.onboardingStep===3)primaryActions=`<button type="button" data-command="finish-onboarding" class="tour-primary">${configuringApi?'继续配置 API Key':'进入控制台'}</button>`;
-    return `<div class="tour-mask tour-step-${this.onboardingStep}" data-onboarding role="dialog" aria-modal="true" aria-labelledby="onboarding-title"><div class="tour-spotlight" aria-hidden="true"></div><section class="tour-card"><header><span class="tour-icon">${icon(step.icon)}</span><div><span class="eyebrow">${escapeHtml(step.kicker)}</span><h2 id="onboarding-title">${escapeHtml(step.title)}</h2></div><span class="tour-count">${this.onboardingStep+1} / ${steps.length}</span></header><p>${escapeHtml(step.body)}</p>${this.onboardingStep===2?'<div class="tour-api-note"><b>关键配置</b><span>申请并保存 DeepSeek API Key</span><small>在线聊天与内容感知增强均依赖 API</small><button type="button" data-command="open-deepseek-api-signup" class="tour-api-link">前往申请</button></div>':''}<footer>${!firstRun?'<button type="button" data-onboarding-close class="tour-quiet">关闭指引</button>':''}${this.onboardingStep>0?'<button type="button" data-onboarding-prev class="tour-quiet">上一步</button>':''}<span class="tour-action-group">${primaryActions}</span></footer><div class="tour-progress">${steps.map((_,index)=>`<i class="${index<=this.onboardingStep?'active':''}"></i>`).join('')}</div></section></div>`;
+    const updatePreference=!firstRun?`<label class="tour-update-preference"><input type="checkbox" data-onboarding-suppress-updates ${this.onboardingSuppressFuture?'checked':''}><span class="tour-checkbox-visual" aria-hidden="true">${icon('check')}</span><span>以后更新时不再主动显示</span></label>`:'';
+    return `<div class="tour-mask tour-step-${this.onboardingStep}${this.onboardingHasEntered?' tour-resume':''}" data-onboarding role="dialog" aria-modal="true" aria-labelledby="onboarding-title"><div class="tour-spotlight" aria-hidden="true"></div><section class="tour-card"><header><span class="tour-icon">${icon(step.icon)}</span><div><span class="eyebrow">${escapeHtml(step.kicker)}</span><h2 id="onboarding-title">${escapeHtml(step.title)}</h2></div><span class="tour-count">${this.onboardingStep+1} / ${steps.length}</span></header><p>${escapeHtml(step.body)}</p>${this.onboardingStep===2?'<div class="tour-api-note"><b>关键配置</b><span>申请并保存 DeepSeek API Key</span><small>在线聊天与内容感知增强均依赖 API</small><button type="button" data-command="open-deepseek-api-signup" class="tour-api-link">前往申请</button></div>':''}${updatePreference}<footer>${!firstRun?'<button type="button" data-onboarding-close class="tour-quiet">关闭指引</button>':''}${this.onboardingStep>0?'<button type="button" data-onboarding-prev class="tour-quiet">上一步</button>':''}<span class="tour-action-group">${primaryActions}</span></footer><div class="tour-progress">${steps.map((_,index)=>`<i class="${index<=this.onboardingStep?'active':''}"></i>`).join('')}</div></section></div>`;
   }
 
   private updateLabel():string{return ({disabled:'仅正式安装版启用',idle:'等待检查',checking:'正在检查',"up-to-date":'已是最新版本',available:'发现新版本',downloading:'正在下载',downloaded:'等待重启安装',error:'检查失败'} as Record<UpdateStatus['phase'],string>)[this.updateStatus.phase]}
@@ -335,6 +396,26 @@ class ConsoleApp {
   }
 
   private metric(iconName:IconName,label:string,value:string,description:string):string{return `<article class="metric-card"><div class="metric-icon">${icon(iconName)}</div><div><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b><small>${escapeHtml(description)}</small></div></article>`}
+  private wellbeingStateLabel():string{return ({learning:'学习节奏',energized:'精力充沛',steady:'状态平稳',tired:'有些疲惫',sleepy:'需要休息'} as Record<string,string>)[this.runtime.wellbeing.state]??'状态平稳'}
+  private wellbeingAdvice():string{
+    const {vitality,mood,state,estimated,baselineDays}=this.runtime.wellbeing;
+    if(estimated)return '当前为基础估算，开启键鼠活动感知后会更贴合你的节奏';
+    if(state==='learning')return `已学习 ${baselineDays} 天，满 3 个有效日后会形成个人基线`;
+    if(vitality<30)return '活力偏低，建议离开屏幕休息几分钟';
+    if(mood<40)return '心情偏低，可以先完成一个更小、更明确的步骤';
+    if(vitality>=75&&mood>=65)return '状态不错，适合继续当前节奏并按时休息';
+    return '整体平稳，保持现在的工作与休息节奏';
+  }
+  private wellbeingCard():string{
+    const wellbeing=this.runtime.wellbeing,vitality=Math.round(wellbeing.vitality),mood=Math.round(wellbeing.mood);
+    const meter=(kind:'vitality'|'mood',label:string,value:number)=>`<div class="wellbeing-meter"><div><span>${label}</span><b data-live="wellbeing-${kind}">${value}</b></div><i><em data-live-bar="wellbeing-${kind}" style="width:${value}%"></em></i></div>`;
+    return `<article class="metric-card wellbeing-card"><div class="metric-icon">${icon('heart')}</div><div class="wellbeing-copy"><div class="wellbeing-heading"><span>当前活力与心情</span><strong data-live="wellbeing-state">${escapeHtml(this.wellbeingStateLabel())}</strong></div><div class="wellbeing-meters">${meter('vitality','活力',vitality)}${meter('mood','心情',mood)}</div><small data-live="wellbeing-advice">${escapeHtml(this.wellbeingAdvice())}</small></div></article>`;
+  }
+  private wellbeingStatsStrip():string{
+    const wellbeing=this.runtime.wellbeing,vitality=Math.round(wellbeing.vitality),mood=Math.round(wellbeing.mood);
+    const meter=(kind:'vitality'|'mood',label:string,value:number)=>`<div class="wellbeing-strip-meter"><div><span>${label}</span><b data-live="wellbeing-${kind}">${value}<small>/ 100</small></b></div><i><em data-live-bar="wellbeing-${kind}" style="width:${value}%"></em></i></div>`;
+    return `<article class="card wellbeing-stats-strip"><div class="wellbeing-strip-heading"><div class="metric-icon">${icon('heart')}</div><div><span>当前活力与心情</span><b data-live="wellbeing-state">${escapeHtml(this.wellbeingStateLabel())}</b></div></div><div class="wellbeing-strip-meters">${meter('vitality','活力',vitality)}${meter('mood','心情',mood)}</div></article>`;
+  }
   private petNameText():string{return this.settings.petName?.trim()||'珊珊'}
   private petName():string{return escapeHtml(this.petNameText())}
   private petNameInitial():string{return escapeHtml(Array.from(this.petNameText())[0]??'珊')}
@@ -417,11 +498,17 @@ class ConsoleApp {
   }
 
   private bind(): void {
+    this.root.querySelectorAll<HTMLElement>('button[aria-label], [role="button"][aria-label]').forEach(item=>{if(!item.getAttribute('title'))item.setAttribute('title',item.getAttribute('aria-label')??'');});
     this.root.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach(el=>el.addEventListener("click",()=>void this.withBusy(el,()=>this.openTab(el.dataset.tab!))));
     this.root.querySelector(".close-window")?.addEventListener("click",()=>void window.petAPI.console.close());
+    this.root.querySelector("[data-window-minimize]")?.addEventListener("click", () => void window.petAPI.windowControls.minimize("console"));
+    this.root.querySelector("[data-window-maximize]")?.addEventListener("click", () => void window.petAPI.windowControls.toggleMaximize("console"));
+    this.root.querySelector("[data-window-close]")?.addEventListener("click", () => void window.petAPI.console.close());
     this.root.querySelector<HTMLButtonElement>('[data-onboarding-next]')?.addEventListener('click',()=>this.showOnboardingStep(1,'privacy'));
     this.root.querySelector<HTMLButtonElement>('[data-onboarding-prev]')?.addEventListener('click',()=>this.showOnboardingStep(Math.max(0,this.onboardingStep-1),this.onboardingStep<=1?'home':this.onboardingStep===2?'privacy':'ai'));
-    this.root.querySelector<HTMLButtonElement>('[data-onboarding-close]')?.addEventListener('click',()=>{this.onboardingOpen=false;this.onboardingFinishTab='home';this.render(true)});
+    this.root.querySelector<HTMLInputElement>('[data-onboarding-suppress-updates]')?.addEventListener('change',(event)=>void this.setOnboardingSuppression((event.currentTarget as HTMLInputElement).checked));
+    this.root.querySelector<HTMLButtonElement>('[data-onboarding-close]')?.addEventListener('click',()=>void this.closeOnboarding());
+    this.root.querySelectorAll<HTMLDialogElement>('.plan-dialog,.confirm-dialog').forEach(dialog=>dialog.addEventListener('close',()=>this.syncConsoleModalScrim()));
     this.root.querySelectorAll<HTMLInputElement>("[data-appearance]").forEach(el=>{
       const update=async()=>{await this.updateNested('appearance',el.dataset.appearance!,this.value(el));this.notify('外观设置已保存')};
       if(el instanceof HTMLInputElement&&el.type==='range')el.addEventListener('input',()=>{
@@ -500,8 +587,75 @@ class ConsoleApp {
       if(event.key==='Escape'){const input=event.target as HTMLInputElement;input.value=this.settings.ai.baseUrl;input.readOnly=true;this.render(true)}
     });
     this.root.querySelector<HTMLTextAreaElement>("[data-list=blockedApps]")?.addEventListener("change",event=>void this.updateNested('sensing','blockedApps',(event.target as HTMLTextAreaElement).value.split(/\r?\n/).map(v=>v.trim()).filter(Boolean)).then(()=>this.notify('内容黑名单已保存')));
+    this.root.querySelector<HTMLButtonElement>('[data-plan-new]')?.addEventListener('click',()=>this.openPlanEditor());
+    this.root.querySelectorAll<HTMLButtonElement>('[data-plan-edit]').forEach(button=>button.addEventListener('click',()=>this.openPlanEditor(button.dataset.planEdit)));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-plan-reuse]').forEach(button=>button.addEventListener('click',()=>this.openPlanEditor(button.dataset.planReuse,true)));
+    const planCreate=this.root.querySelector<HTMLButtonElement>('[data-plan-create]');planCreate?.addEventListener('click',()=>void this.withBusy(planCreate,()=>this.createPlanFromForm()));
+    this.root.querySelector<HTMLInputElement>('[data-plan-title]')?.addEventListener('input',event=>(event.currentTarget as HTMLInputElement).removeAttribute('aria-invalid'));
+    this.root.querySelector<HTMLTextAreaElement>('[data-plan-notes]')?.addEventListener('input',event=>(event.currentTarget as HTMLTextAreaElement).removeAttribute('aria-invalid'));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-plan-recurrence-value]').forEach(button=>button.addEventListener('click',()=>{const value=button.dataset.planRecurrenceValue??'once',input=this.root.querySelector<HTMLInputElement>('[data-plan-recurrence]');if(input)input.value=value;this.root.querySelectorAll<HTMLButtonElement>('[data-plan-recurrence-value]').forEach(option=>{const selected=option===button;option.classList.toggle('selected',selected);option.setAttribute('aria-checked',String(selected));});}));
+    const datePicker=this.root.querySelector<HTMLElement>('[data-plan-date-picker]');
+    datePicker?.addEventListener('click',event=>{
+      const button=(event.target as Element).closest<HTMLButtonElement>('button');if(!button)return;
+      const dateInput=datePicker.querySelector<HTMLInputElement>('[data-plan-date]')!,hourInput=datePicker.querySelector<HTMLInputElement>('[data-plan-hour]')!,minuteInput=datePicker.querySelector<HTMLInputElement>('[data-plan-minute]')!,panel=datePicker.querySelector<HTMLElement>('.plan-datetime-panel')!;
+      const refresh=()=>{const selected=new Date(`${dateInput.value}T12:00:00`),year=Number(datePicker.dataset.viewYear),month=Number(datePicker.dataset.viewMonth);datePicker.querySelector<HTMLElement>('[data-plan-calendar-grid]')!.innerHTML=this.planCalendarDays(year,month,dateInput.value);datePicker.querySelector<HTMLElement>('[data-plan-month-label]')!.textContent=`${year}年${month+1}月`;datePicker.querySelector<HTMLElement>('[data-plan-time-preview]')!.textContent=`${hourInput.value}:${minuteInput.value}`;datePicker.querySelector<HTMLElement>('[data-plan-datetime-label]')!.textContent=`${selected.toLocaleDateString('zh-CN',{month:'long',day:'numeric',weekday:'short'})} · ${hourInput.value}:${minuteInput.value}`};
+      if(button.matches('[data-plan-datetime-trigger]')){const open=panel.hidden;this.closePopovers(datePicker);panel.hidden=!open;button.setAttribute('aria-expanded',String(open));if(open)queueMicrotask(()=>datePicker.querySelectorAll<HTMLElement>('.plan-time-column .selected').forEach(item=>{const column=item.closest<HTMLElement>('.plan-time-column');if(column)column.scrollTop=item.offsetTop-column.clientHeight/2+item.clientHeight/2}));return;}
+      if(button.dataset.planMonthStep){const next=new Date(Number(datePicker.dataset.viewYear),Number(datePicker.dataset.viewMonth)+Number(button.dataset.planMonthStep),1);datePicker.dataset.viewYear=String(next.getFullYear());datePicker.dataset.viewMonth=String(next.getMonth());refresh();return;}
+      if(button.dataset.planCalendarDay){const selected=new Date(`${button.dataset.planCalendarDay}T12:00:00`);dateInput.value=button.dataset.planCalendarDay;datePicker.dataset.viewYear=String(selected.getFullYear());datePicker.dataset.viewMonth=String(selected.getMonth());refresh();return;}
+      if(button.dataset.planDateShortcut){const selected=new Date();selected.setSeconds(0,0);selected.setMinutes(selected.getMinutes()+1);if(button.dataset.planDateShortcut==='tomorrow')selected.setDate(selected.getDate()+1);dateInput.value=`${selected.getFullYear()}-${String(selected.getMonth()+1).padStart(2,'0')}-${String(selected.getDate()).padStart(2,'0')}`;hourInput.value=String(selected.getHours()).padStart(2,'0');minuteInput.value=String(selected.getMinutes()).padStart(2,'0');datePicker.dataset.viewYear=String(selected.getFullYear());datePicker.dataset.viewMonth=String(selected.getMonth());datePicker.querySelectorAll<HTMLButtonElement>('[data-plan-time-part]').forEach(item=>item.classList.toggle('selected',item.dataset.planTimeValue===(item.dataset.planTimePart==='hour'?hourInput.value:minuteInput.value)));refresh();return;}
+      if(button.dataset.planTimePart){const part=button.dataset.planTimePart,value=button.dataset.planTimeValue!;(part==='hour'?hourInput:minuteInput).value=value;datePicker.querySelectorAll<HTMLButtonElement>(`[data-plan-time-part="${part}"]`).forEach(item=>item.classList.toggle('selected',item===button));refresh();return;}
+      if(button.matches('[data-plan-datetime-apply]')){panel.hidden=true;datePicker.querySelector<HTMLButtonElement>('[data-plan-datetime-trigger]')!.setAttribute('aria-expanded','false');refresh();}
+    });
+    this.root.querySelectorAll<HTMLButtonElement>('[data-plan-filter]').forEach(button=>button.addEventListener('click',()=>{if(button.disabled)return;const filter=button.dataset.planFilter!;this.root.querySelectorAll<HTMLButtonElement>('[data-plan-filter]').forEach(item=>item.classList.toggle('selected',item===button));this.root.querySelectorAll<HTMLElement>('[data-plan-task-scope]').forEach(item=>{item.hidden=filter!=='all'&&item.dataset.planTaskScope!==filter});}));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-plan-complete]').forEach(button=>button.addEventListener('click',()=>void this.withBusy(button,async()=>{const result=await window.petAPI.plans.complete(button.dataset.planComplete!);this.plans=result.snapshot;this.render(true);this.notify('计划已完成')})));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-plan-archive]').forEach(button=>button.addEventListener('click',()=>void this.withBusy(button,async()=>{this.plans=await window.petAPI.plans.archive(button.dataset.planArchive!);this.render(true);this.notify('计划已归档')})));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-plan-delete]').forEach(button=>button.addEventListener('click',()=>void this.withBusy(button,async()=>{if(!await this.confirmAction('删除计划？','计划和对应的执行记录会被永久删除。','确认删除'))return;await window.petAPI.plans.delete(button.dataset.planDelete!);this.plans=await window.petAPI.plans.list();this.render(true);this.notify('计划已删除')})));
+    const clearHistory=this.root.querySelector<HTMLButtonElement>('[data-plan-clear-history]');clearHistory?.addEventListener('click',()=>void this.withBusy(clearHistory,async()=>{if(!await this.confirmAction('清空完成记录？','只会清除完成历史，不会删除计划或影响下一次提醒。','确认清空'))return;this.plans=await window.petAPI.plans.clearCompletedHistory();this.render(true);this.notify('完成记录已清空')}));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-plan-inbox-complete]').forEach(button=>button.addEventListener('click',()=>void(async()=>{if(button.disabled)return;button.disabled=true;button.classList.add('completed');try{await new Promise(resolve=>setTimeout(resolve,180));const result=await window.petAPI.plans.respondInbox(button.dataset.planInboxComplete!,'complete');this.plans=result.snapshot;this.render(true);this.notify('提醒已完成')}catch{button.disabled=false;button.classList.remove('completed');this.notify('完成失败，请稍后重试',true)}})()));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-plan-inbox-snooze]').forEach(button=>button.addEventListener('click',()=>void this.withBusy(button,async()=>{const result=await window.petAPI.plans.respondInbox(button.dataset.planInboxSnooze!,'snooze',10);this.plans=result.snapshot;this.render(true);this.notify('将在 10 分钟后再次提醒')})));
     this.bindTimePickers();
     this.bindColorPicker();
+  }
+
+  private finishPlanRow(button: HTMLButtonElement): void {
+    const row=button.closest<HTMLElement>('.plan-task-card');
+    if(!row)return;
+    row.classList.add('is-completing');
+    window.setTimeout(()=>{
+      row.remove();
+      const list=this.root.querySelector<HTMLElement>('.plan-task-list');
+      if(list&&!list.children.length)list.innerHTML='<div class="plan-empty"><b>暂时没有进行中的计划</b><span>点击右上角“新建计划”，或让智能体生成计划草案。</span></div>';
+    },180);
+  }
+  private finishInboxRow(button: HTMLButtonElement): void {
+    const row=button.closest<HTMLElement>('.inbox-row');
+    if(!row)return;
+    row.classList.add('is-completing');
+    window.setTimeout(()=>row.remove(),180);
+  }
+  private planInput(selector:string):string{return this.root.querySelector<HTMLInputElement|HTMLTextAreaElement|HTMLSelectElement>(selector)?.value.trim()??''}
+  private openPlanEditor(taskId?:string,duplicate=false):void{
+    const dialog=this.root.querySelector<HTMLDialogElement>('[data-plan-create-dialog]'),task=taskId?this.plans.tasks.find(item=>item.id===taskId):undefined;if(!dialog)return;
+    const selectedAt=task?new Date(task.nextDueAt??task.dueAt??task.startAt):new Date();if(!task){selectedAt.setSeconds(0,0);selectedAt.setMinutes(selectedAt.getMinutes()+1)}
+    const pad=(value:number)=>String(value).padStart(2,'0'),dateValue=`${selectedAt.getFullYear()}-${pad(selectedAt.getMonth()+1)}-${pad(selectedAt.getDate())}`,hour=pad(selectedAt.getHours()),minute=pad(selectedAt.getMinutes());
+    const setValue=(selector:string,value:string)=>{const input=dialog.querySelector<HTMLInputElement|HTMLTextAreaElement>(selector);if(input)input.value=value};
+    setValue('[data-plan-edit-id]',duplicate?'':task?.id??'');setValue('[data-plan-title]',task?.title??'');setValue('[data-plan-notes]',task?.notes??'');setValue('[data-plan-date]',dateValue);setValue('[data-plan-hour]',hour);setValue('[data-plan-minute]',minute);
+    const recurrence=task?.recurrence.kind??'once';setValue('[data-plan-recurrence]',recurrence);dialog.querySelectorAll<HTMLButtonElement>('[data-plan-recurrence-value]').forEach(option=>{const selected=option.dataset.planRecurrenceValue===recurrence;option.classList.toggle('selected',selected);option.setAttribute('aria-checked',String(selected));});
+    const picker=dialog.querySelector<HTMLElement>('[data-plan-date-picker]');if(picker){picker.dataset.viewYear=String(selectedAt.getFullYear());picker.dataset.viewMonth=String(selectedAt.getMonth());picker.querySelector<HTMLElement>('[data-plan-calendar-grid]')!.innerHTML=this.planCalendarDays(selectedAt.getFullYear(),selectedAt.getMonth(),dateValue);picker.querySelector<HTMLElement>('[data-plan-month-label]')!.textContent=`${selectedAt.getFullYear()}年${selectedAt.getMonth()+1}月`;picker.querySelector<HTMLElement>('[data-plan-time-preview]')!.textContent=`${hour}:${minute}`;picker.querySelector<HTMLElement>('[data-plan-datetime-label]')!.textContent=`${selectedAt.toLocaleDateString('zh-CN',{month:'long',day:'numeric',weekday:'short'})} · ${hour}:${minute}`;picker.querySelectorAll<HTMLButtonElement>('[data-plan-time-part]').forEach(option=>option.classList.toggle('selected',option.dataset.planTimeValue===(option.dataset.planTimePart==='hour'?hour:minute)))}
+    dialog.querySelector<HTMLElement>('[data-plan-dialog-kicker]')!.textContent=task&&!duplicate?'编辑计划':'新建计划';dialog.querySelector<HTMLElement>('[data-plan-dialog-title]')!.textContent=task&&!duplicate?'调整计划内容与提醒':duplicate?'引用完成记录创建计划':'安排一件要提醒的事';dialog.querySelector<HTMLElement>('[data-plan-dialog-description]')!.textContent=task&&!duplicate?'保存后会同步更新计划内容、时间与重复规则。':duplicate?'已带入该记录的内容，请确认新的执行日期与重复规则。':'写清楚具体要做什么，再选择未来一分钟或更晚的时间。';dialog.querySelector<HTMLElement>('[data-plan-create-label]')!.textContent=task&&!duplicate?'保存修改':'创建计划';dialog.showModal();this.syncConsoleModalScrim();dialog.querySelector<HTMLInputElement>('[data-plan-title]')?.focus();
+  }
+  private async createPlanFromForm():Promise<void>{
+    const titleInput=this.root.querySelector<HTMLInputElement>('[data-plan-title]'),title=this.planInput('[data-plan-title]');if(!title){titleInput?.setAttribute('aria-invalid','true');titleInput?.focus();this.notify('请先填写计划标题',true);return;}
+    const notesInput=this.root.querySelector<HTMLTextAreaElement>('[data-plan-notes]'),notes=this.planInput('[data-plan-notes]');if(!notes){notesInput?.setAttribute('aria-invalid','true');notesInput?.focus();this.notify('请写清楚这项计划具体要做什么',true);return;}
+    const planDate=this.planInput('[data-plan-date]');const planClock=this.planInput('[data-plan-clock]')||`${this.planInput('[data-plan-hour]')||'09'}:${this.planInput('[data-plan-minute]')||'00'}`;const rawPlanTime=planDate?`${planDate}T${planClock}`:this.planInput('[data-plan-time]');
+    const startAt=Date.parse(rawPlanTime);if(!Number.isFinite(startAt)){this.notify('请选择有效的计划时间',true);return;}if(startAt<=Date.now()){this.notify('计划时间需要晚于当前时间',true);return;}
+    const id=this.planInput('[data-plan-edit-id]')||undefined,kind=this.planInput('[data-plan-recurrence]');
+    const recurrence:Record<string,unknown>={kind};
+    if(kind==='weekly')recurrence.weekdays=[((new Date(startAt).getDay()+6)%7)+1];
+    if(kind==='monthly-date')recurrence.monthDay=new Date(startAt).getDate();
+    const existing=id?this.plans.tasks.find(task=>task.id===id):undefined;
+    this.plans=await window.petAPI.plans.upsert({id,title,notes,startAt,dueAt:startAt,timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,priority:existing?.priority??'normal',recurrence,reminderOffsets:[0],status:'active',lastTriggeredAt:null,snoozedUntil:null});
+    this.render(true);this.notify(id?'计划已更新':'计划已创建');
   }
 
   private bindTimePickers():void {
@@ -563,7 +717,7 @@ class ConsoleApp {
     this.root.querySelectorAll<HTMLElement>('.popover-panel:not([hidden])').forEach(panel=>{
       if(except?.contains(panel))return;
       panel.hidden=true;
-      const owner=panel.closest('.custom-select, .time-picker, .color-picker');owner?.querySelector<HTMLElement>('[aria-expanded="true"]')?.setAttribute('aria-expanded','false');
+      const owner=panel.closest('.custom-select, .time-picker, .color-picker, .plan-date-picker');owner?.querySelector<HTMLElement>('[aria-expanded="true"]')?.setAttribute('aria-expanded','false');
     });
     if(!except?.classList.contains('color-picker'))this.previewAccent(this.settings.appearance.accentColor);
   }
@@ -618,14 +772,53 @@ class ConsoleApp {
     this.runtime=await window.petAPI.pet.getRuntime();
     this.activity=this.runtime.activity;
     if(tab==='stats'||tab==='home'||tab==='ai')this.stats=await window.petAPI.statistics.get(tab==='stats'?this.statsRange:31);
-    if(tab==='privacy'||tab==='storage')this.activityRules=await window.petAPI.activityRules.list();
+    if(tab==='privacy')this.activityRules=await window.petAPI.activityRules.list();
+    if(tab==='plans')this.plans=await window.petAPI.plans.list();
     this.render();
   }
 
   private showOnboardingStep(step:number, tab:"home"|"privacy"|"ai"):void{
+    const mask=this.root.querySelector<HTMLElement>('[data-onboarding]'),spotlight=mask?.querySelector<HTMLElement>('.tour-spotlight');
+    if(mask&&spotlight){const maskRect=mask.getBoundingClientRect(),rect=spotlight.getBoundingClientRect();this.onboardingTransitionFrom={left:rect.left-maskRect.left,top:rect.top-maskRect.top,width:rect.width,height:rect.height}}
     this.onboardingStep=step;
     this.active=tab;
     this.render();
+  }
+
+  private syncOnboardingGeometry(from:{left:number;top:number;width:number;height:number}|null=null):void{
+    const mask=this.root.querySelector<HTMLElement>('[data-onboarding]');
+    const spotlight=mask?.querySelector<HTMLElement>('.tour-spotlight');
+    if(!mask||!spotlight)return;
+    const targetTab=this.onboardingStep===1?'privacy':this.onboardingStep===2?'ai':this.onboardingStep===3&&this.onboardingFinishTab==='ai'?'ai':'home';
+    const target=this.root.querySelector<HTMLElement>(`[data-tab="${targetTab}"]`);
+    if(!target)return;
+    const maskRect=mask.getBoundingClientRect(),targetRect=target.getBoundingClientRect(),padding=5;
+    const targetGeometry={left:Math.round(targetRect.left-maskRect.left-padding),top:Math.round(targetRect.top-maskRect.top-padding),width:Math.round(targetRect.width+padding*2),height:Math.round(targetRect.height+padding*2)};
+    const apply=(geometry:typeof targetGeometry)=>{spotlight.style.left=`${geometry.left}px`;spotlight.style.top=`${geometry.top}px`;spotlight.style.width=`${geometry.width}px`;spotlight.style.height=`${geometry.height}px`};
+    if(from){spotlight.style.transition='none';apply(from);spotlight.getBoundingClientRect();window.requestAnimationFrame(()=>{spotlight.style.removeProperty('transition');apply(targetGeometry)})}else apply(targetGeometry);
+  }
+
+  private syncConsoleModalScrim():void{
+    const scrim=this.root.querySelector<HTMLElement>('[data-console-modal-scrim]');if(!scrim)return;
+    scrim.hidden=!this.root.querySelector('.plan-dialog[open],.confirm-dialog[open]');
+  }
+
+  private async closeOnboarding():Promise<void>{
+    this.settings.onboardingLastShownVersion=this.updateStatus.currentVersion;
+    this.settings.suppressOnboardingAfterUpdates=this.onboardingSuppressFuture;
+    this.settings=await window.petAPI.settings.update(this.settings);
+    this.onboardingOpen=false;
+    this.onboardingHasEntered=false;
+    this.onboardingTransitionFrom=null;
+    this.onboardingStep=0;
+    this.onboardingFinishTab='home';
+    this.render(true);
+  }
+
+  private async setOnboardingSuppression(suppressed:boolean):Promise<void>{
+    this.onboardingSuppressFuture=suppressed;
+    this.settings.suppressOnboardingAfterUpdates=suppressed;
+    this.settings=await window.petAPI.settings.update(this.settings);
   }
 
   private async refreshStatistics(renderPage=false):Promise<void>{
@@ -711,6 +904,13 @@ class ConsoleApp {
     this.root.querySelectorAll('.status-dot').forEach(dot=>dot.classList.toggle('off',!this.sensingActive()));
     this.root.querySelectorAll('.status-text').forEach(status=>{status.classList.toggle('ok',this.sensingActive());status.classList.toggle('warn',!this.sensingActive())});
     this.updateSensingControl();
+    const vitality=Math.round(this.runtime.wellbeing.vitality),mood=Math.round(this.runtime.wellbeing.mood);
+    this.setLive('wellbeing-vitality',String(vitality));
+    this.setLive('wellbeing-mood',String(mood));
+    this.setLive('wellbeing-state',this.wellbeingStateLabel());
+    this.setLive('wellbeing-advice',this.wellbeingAdvice());
+    this.root.querySelectorAll<HTMLElement>('[data-live-bar="wellbeing-vitality"]').forEach(bar=>bar.style.width=`${vitality}%`);
+    this.root.querySelectorAll<HTMLElement>('[data-live-bar="wellbeing-mood"]').forEach(bar=>bar.style.width=`${mood}%`);
     if(this.active!=='home'&&this.active!=='privacy')return;
     this.setLive('mode-headline',this.modeHeadline());
     this.setLive('mode-label',this.modeLabel());
@@ -733,7 +933,7 @@ class ConsoleApp {
   }
 
   private notify(message:string,error=false):void{
-    const toast=this.root.querySelector<HTMLElement>('.toast');
+    const toast=this.root.querySelector<HTMLElement>('.plan-create-dialog[open] .dialog-toast')??this.root.querySelector<HTMLElement>('.toast:not(.dialog-toast)');
     if(!toast)return;
     const target=toast.querySelector<HTMLElement>('.toast-message');
     if(target)target.textContent=message;
@@ -762,7 +962,7 @@ class ConsoleApp {
     return new Promise(resolve=>{
       const finish=()=>resolve(dialog.returnValue==='confirm');
       dialog.addEventListener('close',finish,{once:true});
-      dialog.showModal();
+      dialog.showModal();this.syncConsoleModalScrim();
     });
   }
 
@@ -791,17 +991,17 @@ class ConsoleApp {
       if(command==='refresh-stats'){await this.refreshStatistics(true);this.notify('统计已刷新')}
       if(command==='check-update'){this.updateStatus=await window.petAPI.updates.check();this.syncUpdatePanel();this.notify(this.updateStatus.message,this.updateStatus.phase==='error')}
       if(command==='download-update'){this.updateStatus=await window.petAPI.updates.download();this.syncUpdatePanel();this.notify(this.updateStatus.message,this.updateStatus.phase==='error')}
-      if(command==='install-update'){if(!await this.confirmAction('立即安装更新？','桌宠会安全退出并重新启动，设置、聊天和统计数据都会保留。','重启并安装'))return;const started=await window.petAPI.updates.install();if(!started)this.notify('更新尚未下载完成',true)}
+      if(command==='install-update'){const started=await window.petAPI.updates.install();if(!started)this.notify('更新尚未下载完成',true)}
       if(command==='open-release-page'){await window.petAPI.updates.openReleases();this.notify('已打开官方发布页')}
-      if(command==='show-onboarding'){this.onboardingOpen=true;this.onboardingFinishTab='home';this.showOnboardingStep(0,'home')}
+      if(command==='show-onboarding'){this.onboardingOpen=true;this.onboardingHasEntered=false;this.onboardingTransitionFrom=null;this.onboardingSuppressFuture=this.settings.suppressOnboardingAfterUpdates;this.onboardingFinishTab='home';this.showOnboardingStep(0,'home')}
       if(command==='onboarding-private'){this.settings.firstRunConsent=true;this.settings.sensing.enabled=false;await this.save();this.runtime=await window.petAPI.pet.getRuntime();this.showOnboardingStep(2,'ai');this.notify('本地感知保持关闭，可稍后开启')}
       if(command==='onboarding-enable'){this.settings.firstRunConsent=true;this.settings.sensing.enabled=true;await this.save();await this.resumeSensing();this.runtime=await window.petAPI.pet.getRuntime();this.showOnboardingStep(2,'ai');this.notify('本地感知已按说明开启')}
       if(command==='onboarding-ai-later'){this.onboardingFinishTab='home';this.showOnboardingStep(3,'home')}
       if(command==='onboarding-open-ai'){this.onboardingFinishTab='ai';this.showOnboardingStep(3,'ai')}
-      if(command==='finish-onboarding'){const finishingApi=this.onboardingFinishTab==='ai';this.onboardingOpen=false;this.onboardingStep=0;this.onboardingFinishTab='home';this.render();this.notify(finishingApi?'请粘贴 DeepSeek API Key 并安全保存':`欢迎使用${this.petNameText()}桌宠`)}
+      if(command==='finish-onboarding'){const finishingApi=this.onboardingFinishTab==='ai';await this.closeOnboarding();this.notify(finishingApi?'请粘贴 DeepSeek API Key 并安全保存':`欢迎使用${this.petNameText()}桌宠`)}
       if(command==='reset-all'){if(!await this.confirmAction('恢复全部默认设置？',`所有偏好、统计与聊天记录都会被清空，${this.petNameText()}将恢复初始状态。`,'恢复默认设置'))return;await window.petAPI.storage.resetAll();location.reload()}
       if(command==='clear-all'){if(!await this.confirmAction('清除全部本地数据并重启？','统计、聊天、学习规则、设置、加密 API Key、缓存和授权都会删除；仅会递归清理由应用安全标记的目录。','清除并重启'))return;await window.petAPI.storage.clearAll()}
-      if(command==='consent'){this.settings.firstRunConsent=true;this.settings.sensing.enabled=true;await this.save();await this.resumeSensing();this.onboardingOpen=false;this.runtime=await window.petAPI.pet.getRuntime();this.render(true);this.notify('本地感知已启用')}
+      if(command==='consent'){this.settings.firstRunConsent=true;this.settings.onboardingLastShownVersion=this.updateStatus.currentVersion;this.settings.suppressOnboardingAfterUpdates=this.onboardingSuppressFuture;this.settings.sensing.enabled=true;await this.save();await this.resumeSensing();this.onboardingOpen=false;this.runtime=await window.petAPI.pet.getRuntime();this.render(true);this.notify('本地感知已启用')}
       if(command==='context-preview'){const preview=this.root.querySelector('.context-preview')!;preview.textContent='正在读取并脱敏当前上下文…';const context=await window.petAPI.chat.contextPreview();preview.textContent=JSON.stringify(context,null,2)}
       if(command==='chat'){await window.petAPI.pet.openChat();this.notify('智能体聊天已打开')}
       if(command==='toggle-sensing'){

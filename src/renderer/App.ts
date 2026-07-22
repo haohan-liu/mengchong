@@ -319,6 +319,7 @@ export class PetApp {
     this.bubble.classList.remove("closing");
     this.bubbleText.textContent = text;
     this.bubble.hidden = false;
+    window.petAPI.pet.raiseBubble();
     window.clearTimeout(this.bubbleTimer);
     this.bubbleTimer = window.setTimeout(() => this.closeBubble(), this.settings.appearance.bubbleDurationSeconds * 1000);
   }

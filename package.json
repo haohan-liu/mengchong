@@ -1,6 +1,6 @@
 {
   "name": "ai-desktop-pet",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "private": true,
   "description": "轻量、隐私可控的 Windows AI 桌宠",
   "author": {
@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
     "build:renderer": "vite build --configLoader runner",
     "build:electron": "tsc -p electron/tsconfig.json",
+    "build:installer-assets": "node scripts/build-installer-assets.mjs",
     "build:sensor": "node scripts/build-sensor.mjs",
     "build": "npm run validate:prompts && npm run validate:assets && npm run test && npm run typecheck && npm run build:sensor && npm run build:renderer && npm run build:electron",
     "validate:prompts": "tsx scripts/validate-prompts.ts",
@@ -58,6 +59,13 @@
       {
         "from": "assets/icons/app-icon.png",
         "to": "app-icon.png",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "assets/icons/app-icon.ico",
+        "to": "app-icon.ico",
         "filter": [
           "**/*"
         ]

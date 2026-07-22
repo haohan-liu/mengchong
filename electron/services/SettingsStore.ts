@@ -3,13 +3,15 @@ import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises
 import { dirname, join } from "node:path";
 import type { Settings } from "../../src/types.js";
 
-export const SETTINGS_VERSION = 8;
+export const SETTINGS_VERSION = 10;
 
 export function defaultSettings(): Settings {
   return {
     version: SETTINGS_VERSION,
     petName: "珊珊",
     firstRunConsent: false,
+    onboardingLastShownVersion: "",
+    suppressOnboardingAfterUpdates: false,
     appearance: {
       scale: 1,
       alwaysOnTop: true,
@@ -35,7 +37,7 @@ export function defaultSettings(): Settings {
       power: true,
       network: true,
       autoContext: true,
-      smartActivityLearning: false,
+      smartActivityLearning: true,
       blockedApps: ["1password", "bitwarden", "keepass", "credentialui", "password"],
       allowedApps: []
     },
@@ -52,6 +54,10 @@ export function defaultSettings(): Settings {
       fullscreenSilent: true,
       autostart: true,
       startupDelaySeconds: 3
+    },
+    wellbeing: {
+      enabled: true,
+      desktopHints: true
     },
     ai: {
       baseUrl: "https://api.deepseek.com",
@@ -80,6 +86,7 @@ export function mergeSettings(input: Partial<Settings>): Settings {
   const appearance = object(record.appearance);
   const sensing = object(record.sensing);
   const reminders = object(record.reminders);
+  const wellbeing = object(record.wellbeing);
   const ai = object(record.ai);
   const toolPermissions = object(ai.toolPermissions);
   const boolean = (value: unknown, fallback: boolean): boolean => typeof value === "boolean" ? value : fallback;
@@ -115,6 +122,8 @@ export function mergeSettings(input: Partial<Settings>): Settings {
     ...base,
     petName,
     firstRunConsent: boolean(record.firstRunConsent, base.firstRunConsent),
+    onboardingLastShownVersion: typeof record.onboardingLastShownVersion === "string" ? record.onboardingLastShownVersion.trim().slice(0, 40) : base.onboardingLastShownVersion,
+    suppressOnboardingAfterUpdates: boolean(record.suppressOnboardingAfterUpdates, base.suppressOnboardingAfterUpdates),
     manualMode,
     manualState: manualStates.includes(record.manualState as typeof manualStates[number]) ? record.manualState as typeof manualStates[number] : null,
     manualUntil: record.manualUntil === null ? null : number(record.manualUntil, 0, 0, Number.MAX_SAFE_INTEGER) || null,
@@ -153,6 +162,10 @@ export function mergeSettings(input: Partial<Settings>): Settings {
       meetingSilent: boolean(reminders.meetingSilent, base.reminders.meetingSilent), fullscreenSilent: boolean(reminders.fullscreenSilent, base.reminders.fullscreenSilent),
       autostart: boolean(reminders.autostart, base.reminders.autostart),
       startupDelaySeconds: number(reminders.startupDelaySeconds, base.reminders.startupDelaySeconds, 0, 30)
+    },
+    wellbeing: {
+      enabled: boolean(wellbeing.enabled, base.wellbeing.enabled),
+      desktopHints: boolean(wellbeing.desktopHints, base.wellbeing.desktopHints)
     },
     ai: {
       baseUrl: typeof ai.baseUrl === "string" && /^https?:\/\//i.test(ai.baseUrl) ? ai.baseUrl.trim() : base.ai.baseUrl,

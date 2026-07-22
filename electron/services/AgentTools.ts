@@ -1,17 +1,28 @@
 import { BrowserWindow, shell, type WebContents } from "electron";
 import { execFile, spawn } from "node:child_process";
-import type { AgentToolCall, ActivitySnapshot, ContentContext } from "../../src/types.js";
+import type { AgentToolCall, ActivitySnapshot, ChatActionCard, ChatActionResult, ContentContext, PlanTask, WellbeingSnapshot } from "../../src/types.js";
 import { validateToolCall } from "../../src/shared/AgentToolPolicy.js";
+import { accentPaletteForPreference } from "../../src/shared/accent-palette.js";
 
 export class AgentTools {
+  private static readonly ACTION_CARD_TTL_MS = 10 * 60_000;
   private approvals = new Map<string, { resolve: (approved: boolean) => void; senderId: number; conversationId: string }>();
   private conversationApprovals = new Map<number, Map<string, Set<AgentToolCall["name"]>>>();
   constructor(private callbacks: {
     getActivity: () => ActivitySnapshot;
     getContext: () => ContentContext | Promise<ContentContext>;
+    getSystemSummary?: () => Record<string, unknown> | Promise<Record<string, unknown>>;
+    getWellbeing?: () => WellbeingSnapshot;
+    checkUpdates?: () => Promise<unknown>;
+    findPlans?: (query: string) => unknown;
     getPetName: () => string;
     getToolPermission?: (name: AgentToolCall["name"]) => "ask" | "allow" | "deny";
     setAction: (action: string) => boolean;
+    setAccent?: (color: string) => Promise<boolean>;
+    setScale?: (scale: number) => Promise<boolean>;
+    createPlan?: (input: Partial<PlanTask>) => Promise<boolean>;
+    updateChatActionCard?: (conversationId: string, card: ChatActionCard) => Promise<void>;
+    updateAction?: (action: string) => Promise<{ ok: boolean; message: string }>;
     openConsole: () => Promise<void>;
     showNotification: (title: string, body: string) => void;
   }) {}
@@ -32,8 +43,79 @@ export class AgentTools {
   }
 
   private pendingCalls = new Map<string, AgentToolCall>();
+  private actionCards = new Map<string, { card: ChatActionCard; senderId: number; conversationId: string }>();
+  private conversationBySender = new Map<number, string>();
 
   clearConversationApprovals(sender: WebContents): void { this.conversationApprovals.delete(sender.id); }
+
+  private expireActionCard(id: string): void {
+    const item = this.actionCards.get(id);
+    if (!item || item.card.status !== "pending") return;
+    item.card.status = "stale";
+    item.card.result = "长时间未处理，这项建议已自动失效。需要时请让智能体重新生成。";
+    item.card.revision = Date.now();
+    if (item.conversationId) void this.callbacks.updateChatActionCard?.(item.conversationId, item.card);
+  }
+
+  private propose(sender: WebContents, type: ChatActionCard["type"], title: string, description: string, payload: Record<string, unknown>, actions: ChatActionCard["actions"], conversationId?: string): string {
+    const resolvedConversationId = conversationId ?? this.conversationBySender.get(sender.id);
+    const key = JSON.stringify(payload);
+    const existing = [...this.actionCards.values()].find((item) => item.senderId === sender.id && item.conversationId === (resolvedConversationId ?? "") && item.card.type === type && item.card.status === "pending" && JSON.stringify(item.card.payload) === key);
+    if (existing) return JSON.stringify({ ok: true, cardId: existing.card.id, message: "同一条建议已经在当前对话中，等待你的确认" });
+    // Keep one actionable proposal of each kind per conversation. A revised
+    // proposal supersedes the previous one instead of stacking duplicate cards.
+    for (const item of this.actionCards.values()) {
+      if (item.senderId !== sender.id || item.conversationId !== (resolvedConversationId ?? "") || item.card.type !== type || item.card.status !== "pending") continue;
+      item.card.status = "stale";
+      item.card.result = "已由更新后的建议替代，请使用下方最新卡片。";
+      item.card.revision = Date.now();
+      if (item.conversationId) void this.callbacks.updateChatActionCard?.(item.conversationId, item.card);
+      sender.send("chat:action-result", structuredClone(item.card));
+    }
+    const resolvedActions = actions.some((action) => action.id === "cancel") ? actions : [...actions, { id: "cancel", label: "取消本次操作", style: "quiet" as const }];
+    const card: ChatActionCard = { id: crypto.randomUUID(), conversationId: resolvedConversationId, type, revision: Date.now(), title, description, payload, actions: resolvedActions, status: "pending", createdAt: Date.now() };
+    this.actionCards.set(card.id, { card, senderId: sender.id, conversationId: resolvedConversationId ?? "" });
+    sender.send("chat:action-card", card);
+    setTimeout(() => {
+      const item = this.actionCards.get(card.id);
+      if (!item || item.card.status !== "pending") return;
+      this.expireActionCard(card.id);
+      sender.send("chat:action-result", structuredClone(item.card));
+    }, AgentTools.ACTION_CARD_TTL_MS);
+    return JSON.stringify({ ok: true, cardId: card.id, message: "已生成可点击建议卡片，等待用户确认" });
+  }
+
+  actionCard(id: string, sender: WebContents): ChatActionCard | null {
+    const item = this.actionCards.get(id);
+    return item?.senderId === sender.id ? structuredClone(item.card) : null;
+  }
+
+  async executeActionCard(id: string, action: string, sender: WebContents): Promise<ChatActionResult> {
+    const pending = this.actionCards.get(id);
+    if (!pending || pending.senderId !== sender.id) return { ok: false, status: "stale", message: "该建议已失效，请让智能体重新生成" };
+    const card = pending.card;
+    if (card.status !== "pending") return { ok: false, status: card.status, message: card.result || "这条建议已经处理过了" };
+    let result: { ok: boolean; message: string } = { ok: false, message: "不支持的建议操作" };
+    if (action === "cancel") {
+      card.status = "cancelled";
+      card.result = "已取消，没有更改任何设置或计划";
+      result = { ok: true, message: card.result };
+    } else if (card.type === "accent-colors" && action.startsWith("apply:")) {
+      const color = action.slice(6).toLowerCase(); const colors = Array.isArray(card.payload.colors) ? card.payload.colors.map(String) : [];
+      result = /^#[0-9a-f]{6}$/.test(color) && colors.includes(color) && this.callbacks.setAccent ? { ok: await this.callbacks.setAccent(color), message: "强调色已实时应用" } : { ok: false, message: "颜色建议已失效" };
+    } else if (card.type === "pet-scale" && action === "apply") {
+      const scale = Number(card.payload.scale); result = Number.isFinite(scale) && scale >= .6 && scale <= 1.5 && this.callbacks.setScale ? { ok: await this.callbacks.setScale(scale), message: "桌宠尺寸已实时调整" } : { ok: false, message: "尺寸建议已失效" };
+    } else if (card.type === "plan" && action === "create") {
+      result = card.type === "plan" && this.callbacks.createPlan ? { ok: await this.callbacks.createPlan(card.payload as Partial<PlanTask>), message: "计划已创建" } : { ok: false, message: "计划服务暂不可用" };
+    } else if (card.type === "update" && this.callbacks.updateAction) result = await this.callbacks.updateAction(action);
+    else if (card.type === "shortcut" && action === "open") { await this.callbacks.openConsole(); result = { ok: true, message: "已打开对应页面" }; }
+    if (action !== "cancel") card.status = result.ok ? "executed" : "failed";
+    card.result = result.message;
+    card.revision = Date.now();
+    if (pending.conversationId) await this.callbacks.updateChatActionCard?.(pending.conversationId, card);
+    sender.send("chat:action-result", card);
+    return { ok: result.ok, status: card.status, message: result.message };
+  }
 
   private isConversationAllowed(sender: WebContents, conversationId: string | undefined, name: AgentToolCall["name"]): boolean {
     return Boolean(conversationId && this.conversationApprovals.get(sender.id)?.get(conversationId)?.has(name));
@@ -173,7 +255,35 @@ export class AgentTools {
     return JSON.stringify({ ok: true, app: target.label });
   }
 
+  private planTimeFromSchedule(raw: unknown): number | null {
+    const text = String(raw ?? "").trim();
+    const now = new Date();
+    const clock = text.match(/(?:上午|下午|今晚|早上)?\s*([01]?\d|2[0-3])\s*[:：点]\s*([0-5]\d)?/);
+    const local = new Date(now);
+    if (/明天|明日/.test(text)) local.setDate(local.getDate() + 1);
+    const absolute = text.match(/(\d{4})\s*[/-年]\s*(\d{1,2})\s*[/-月]\s*(\d{1,2})/);
+    if (absolute) local.setFullYear(Number(absolute[1]), Number(absolute[2]) - 1, Number(absolute[3]));
+    if (clock) local.setHours(Number(clock[1]), Number(clock[2] ?? 0), 0, 0);
+    else if (!/今天|今日|明天|明日/.test(text) && !absolute) return null;
+    const timestamp = local.getTime();
+    return timestamp > Date.now() ? timestamp : null;
+  }
+
+  private proposePlan(sender: WebContents, conversationId: string | undefined, args: Record<string, unknown>): string {
+    const schedule = String(args.schedule ?? "").trim();
+    const dueAt = this.planTimeFromSchedule(schedule);
+    if (!dueAt) return JSON.stringify({ ok: false, error: "计划时间已过去或格式不完整。请提供未来时间，例如“今天 18:30”或“明天 09:00”。" });
+    const recurrence = /每月最后/.test(schedule) ? { kind: "monthly-last-day" } : /每月/.test(schedule) ? { kind: "monthly-date", monthDay: new Date(dueAt).getDate() } : /工作日/.test(schedule) ? { kind: "weekly", weekdays: [1, 2, 3, 4, 5, 6] } : /每周/.test(schedule) ? { kind: "weekly", weekdays: [((new Date(dueAt).getDay() + 6) % 7) + 1] } : /每天|每日/.test(schedule) ? { kind: "daily" } : { kind: "once" };
+    const time = new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).format(dueAt);
+    const title = String(args.title ?? "未命名计划").trim().slice(0, 120) || "未命名计划";
+    const notes = String(args.notes ?? "").replace(/\s+/g, " ").trim().slice(0, 2_000);
+    const labels = { once: "单次", daily: "每天", weekly: "每周", "monthly-date": "每月", "monthly-last-day": "每月最后一天" } as const;
+    const detail = [`内容：${notes || "未填写具体内容"}`, `时间：${time}`, `规则：${labels[recurrence.kind as keyof typeof labels]}`].join("\n");
+    return this.propose(sender, "plan", title, detail, { title, startAt: dueAt, dueAt, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, recurrence, notes, reminderOffsets: [0] }, [{ id: "create", label: "确认创建", style: "primary" }], conversationId);
+  }
+
   async execute(name: string, rawArguments: string, sender: WebContents, conversationId?: string): Promise<string> {
+    this.conversationBySender.set(sender.id, conversationId ?? "");
     const parsed = rawArguments.trim() ? JSON.parse(rawArguments) : {};
     const call = validateToolCall(name, parsed);
     if (call.risk === "confirm") {
@@ -182,8 +292,32 @@ export class AgentTools {
       if (permission === "ask" && !this.isConversationAllowed(sender, conversationId, call.name) && !(await this.approval(call, sender, conversationId))) return JSON.stringify({ ok: false, error: "用户未授权" });
     }
     const args = call.arguments;
+    if (call.name === "propose_plan") return this.proposePlan(sender, conversationId, args);
     switch (call.name) {
       case "get_activity_summary": return JSON.stringify({ ok: true, activity: this.callbacks.getActivity() });
+      case "get_system_summary": return JSON.stringify({ ok: true, system: await this.callbacks.getSystemSummary?.() ?? {} });
+      case "get_wellbeing": return JSON.stringify({ ok: true, wellbeing: this.callbacks.getWellbeing?.() ?? null });
+      case "find_plans": return JSON.stringify({ ok: true, plans: this.callbacks.findPlans?.(String(args.query ?? "")) ?? [] });
+      case "check_for_updates": {
+        const update = await this.callbacks.checkUpdates?.();
+        return this.propose(sender, "update", "检查更新", "已获取当前更新状态；下载和安装仍需你点击确认。", { update }, [{ id: "download", label: "下载最新版", style: "primary" }, { id: "install", label: "安装已验证版本", style: "secondary" }, { id: "open", label: "打开更新页", style: "quiet" }]);
+      }
+      case "propose_accent_colors": {
+        const preference = String(args.preference ?? "").trim();
+        const palette = accentPaletteForPreference(preference);
+        return this.propose(sender, "accent-colors", `${palette.label}强调色建议`, "这些颜色只会在你点击后应用；取消不会更改当前界面。", { colors: palette.colors, preference }, palette.colors.map((color) => ({ id: `apply:${color}`, label: color, style: "primary" })), conversationId);
+      }
+      case "propose_pet_scale": {
+        const scale = Math.max(.6, Math.min(1.5, Number(args.scale) || 1));
+        return this.propose(sender, "pet-scale", "桌宠尺寸建议", `建议调整为 ${Math.round(scale * 100)}%，点击后会立即同步桌面与控制台。`, { scale }, [{ id: "apply", label: `应用 ${Math.round(scale * 100)}%`, style: "primary" }]);
+      }
+      default: {
+        const schedule = String(args.schedule ?? ""); const parsedTime = Date.parse(schedule.replace(/年|月/g, "-").replace(/日/g, ""));
+        const dueAt = Number.isFinite(parsedTime) ? parsedTime : Date.now() + 60 * 60_000;
+        const recurrence = schedule.includes("每月最后") ? { kind: "monthly-last-day" } : schedule.includes("每月") ? { kind: "monthly-date", monthDay: new Date(dueAt).getDate() } : schedule.includes("工作日") ? { kind: "weekly", weekdays: [1, 2, 3, 4, 5, 6] } : schedule.includes("每周") ? { kind: "weekly", weekdays: [((new Date(dueAt).getDay() + 6) % 7) + 1] } : schedule.includes("每天") ? { kind: "daily" } : { kind: "once" };
+        const notes = String(args.notes ?? "").replace(/\s+/g, " ").trim().slice(0, 2_000);
+        return this.propose(sender, "plan", String(args.title || "计划草案"), `内容：${notes || "未填写具体内容"}\n时间：${new Date(dueAt).toLocaleString("zh-CN")}\n确认后才会保存到计划中心。`, { title: String(args.title), startAt: dueAt, dueAt, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, recurrence, notes, reminderOffsets: [0] }, [{ id: "create", label: "确认创建", style: "primary" }], conversationId);
+      }
       case "read_current_context": return JSON.stringify({ ok: true, context: await this.callbacks.getContext() });
       case "set_pet_action": return JSON.stringify({ ok: this.callbacks.setAction(String(args.action)) });
       case "open_console": await this.callbacks.openConsole(); return JSON.stringify({ ok: true });
@@ -192,11 +326,7 @@ export class AgentTools {
         return this.visibleWebResult(String(args.url), sender);
       }
       case "launch_app": return this.launchKnownApp(String(args.app), args.expression);
-      case "create_reminder": {
-        const minutes = Math.max(0, Math.min(1440, Number(args.minutes)));
-        setTimeout(() => this.callbacks.showNotification(`${this.callbacks.getPetName()}提醒`, String(args.title)), minutes * 60_000);
-        return JSON.stringify({ ok: true, id: crypto.randomUUID() });
-      }
+      case "create_reminder": return this.propose(sender, "plan", String(args.title || "提醒草案"), `内容：${String(args.notes ?? "到时提醒我处理这件事").trim()}\n时间：${Math.max(0, Math.min(1440, Number(args.minutes)))} 分钟后`, { title: String(args.title), notes: String(args.notes ?? "").trim(), startAt: Date.now() + Math.max(0, Math.min(1440, Number(args.minutes))) * 60_000, dueAt: Date.now() + Math.max(0, Math.min(1440, Number(args.minutes))) * 60_000, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, recurrence: { kind: "once" }, reminderOffsets: [0] }, [{ id: "create", label: "确认创建", style: "primary" }], conversationId);
       case "complete_reminder":
       case "snooze_reminder":
       case "focus_timer": return JSON.stringify({ ok: false, error: "该工具尚未提供可验证的持久执行能力" });
