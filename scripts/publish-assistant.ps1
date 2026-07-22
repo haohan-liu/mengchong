@@ -46,6 +46,7 @@ $script:GhPath = $null
 $script:GitHubReady = $false
 $script:ReplaceRemoteMain = $false
 $script:LastGitHubProbeError = ""
+$script:LastGitHubProbeOutput = ""
 $GitHubProbeTimeoutSeconds = 30
 
 # 发布助手启动的 npm/electron-builder 子进程统一使用国内二进制镜像。
@@ -86,6 +87,7 @@ function Test-NativeProbe([scriptblock]$Operation) {
 # 命令，以便保留上传进度和较长的合理等待时间。
 function Test-GitHubCliProbe([string[]]$Arguments, [string]$Description, [int]$TimeoutSeconds = $GitHubProbeTimeoutSeconds) {
   $script:LastGitHubProbeError = ""
+  $script:LastGitHubProbeOutput = ""
   $startInfo = [Diagnostics.ProcessStartInfo]::new()
   $startInfo.FileName = $script:GhPath
   $startInfo.Arguments = $Arguments -join ' '
@@ -108,6 +110,7 @@ function Test-GitHubCliProbe([string[]]$Arguments, [string]$Description, [int]$T
     }
     $stdoutTask.Wait()
     $stderrTask.Wait()
+    $script:LastGitHubProbeOutput = $stdoutTask.Result
     $script:LastGitHubProbeError = $stderrTask.Result.Trim()
     return $process.ExitCode -eq 0
   } finally {
@@ -564,7 +567,7 @@ function Complete-ReleaseUpload([string]$Version, [string[]]$Assets, [string]$No
   Confirm-GitHubLoginBeforePublish
 
   Write-Info "正在检查目标版本是否已存在（最多等待 $GitHubProbeTimeoutSeconds 秒）…"
-  $releaseExists = Test-GitHubCliProbe @("release", "view", $tag, "--repo", $ReleaseRepoSlug) "GitHub Release 检查"
+  $releaseExists = Test-GitHubCliProbe @("release", "view", $tag, "--repo", $ReleaseRepoSlug, "--json", "url,assets") "GitHub Release 检查"
   if (-not $releaseExists) {
     $arguments = @("release", "create", $tag) + $Assets + @(
       "--repo", $ReleaseRepoSlug,
@@ -575,12 +578,23 @@ function Complete-ReleaseUpload([string]$Version, [string[]]$Assets, [string]$No
     )
     Invoke-Native $script:GhPath $arguments "创建 GitHub Release 或上传文件失败"
   } else {
-    Write-Warn "$tag 已经存在，将只做远端完整性校验，不覆盖已有资产。"
+    $existingRelease = $script:LastGitHubProbeOutput | ConvertFrom-Json
+    $remoteAssetNames = @($existingRelease.assets | ForEach-Object { $_.name })
+    $missingAssets = @($Assets | Where-Object { $remoteAssetNames -notcontains (Split-Path $_ -Leaf) })
+    if ($missingAssets.Count -gt 0) {
+      $missingNames = @($missingAssets | ForEach-Object { Split-Path $_ -Leaf })
+      Write-Warn "$tag 已存在但发布未完整，将断点续传缺少的文件：$($missingNames -join '、')"
+      $uploadArguments = @("release", "upload", $tag) + $missingAssets + @("--repo", $ReleaseRepoSlug)
+      Invoke-Native $script:GhPath $uploadArguments "补传 GitHub Release 文件失败"
+    } else {
+      Write-Ok "$tag 已经存在，且三个更新文件均已上传；不会覆盖已有资产。"
+    }
   }
 
-  $jsonText = (& $script:GhPath release view $tag --repo $ReleaseRepoSlug --json url,assets)
-  if ($LASTEXITCODE -ne 0) { throw "Release 已提交，但发布后校验失败，请到网页确认。" }
-  $release = $jsonText | ConvertFrom-Json
+  if (-not (Test-GitHubCliProbe @("release", "view", $tag, "--repo", $ReleaseRepoSlug, "--json", "url,assets") "发布后远端校验" 30)) {
+    throw "Release 已提交，但发布后校验失败，请到网页确认。$($script:LastGitHubProbeError)"
+  }
+  $release = $script:LastGitHubProbeOutput | ConvertFrom-Json
   Assert-RemoteReleaseAssets $release $Assets
   if (Test-Path $PendingReleasePath) { Remove-Item -LiteralPath $PendingReleasePath -Force }
   Write-Ok "发布完成且 3 个更新文件均已在远端确认"
